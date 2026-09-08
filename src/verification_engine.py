@@ -3,14 +3,18 @@ Phase 3 & 4: Opus 5 as investigative researcher with strict math and synthesis.
 This module orchestrates verification and generates analytical summaries.
 """
 import os
+import sys
 import json
 from datetime import datetime
 from typing import Optional, Dict, Any, List
 
-from .database import get_session, init_db
-from .models import Bet, Leg, Context
-from .search_agent import SearchAgent
-from .math_calculator import ParlayCalculator
+# Add parent directory to path for imports
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from database import get_session, init_db
+from models import Bet, Leg, Context
+from search_agent import SearchAgent
+from math_calculator import ParlayCalculator
 
 
 class VerificationEngine:

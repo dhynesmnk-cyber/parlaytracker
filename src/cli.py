@@ -166,8 +166,8 @@ def cmd_verify_leg(args):
         print("Set ANTHROPIC_API_KEY environment variable to test verification.")
         return
     
-    from src.search_agent import SearchAgent
-    from src.verification_engine import VerificationEngine
+    from search_agent import SearchAgent
+    from verification_engine import VerificationEngine
     
     # Test leg
     test_leg = {
