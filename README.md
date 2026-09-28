@@ -4,6 +4,7 @@ Private, two-user analytics for US sports betting. It records placed bets and un
 opportunities on **Over** markets (singles, parlays and same-game parlays) and shows, from
 the pooled history, where there is a real edge.
 
+- **[CLAUDE.md](CLAUDE.md)** is read automatically by Claude Code sessions.
 - **[SPEC.md](SPEC.md)** is the design and the build plan. Build its phases in order.
 - **[HANDOVER.md](HANDOVER.md)** says which phases are done and what to do next.
 - **[deploy/README.md](deploy/README.md)** sets the app up on the home laptop, reachable over Tailscale.
