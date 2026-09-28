@@ -1,0 +1,138 @@
+[
+ {
+  "id": "47dc7baa254659f3beb2ed2b38c207b6",
+  "sport_key": "americanfootball_nfl",
+  "sport_title": "NFL",
+  "commence_time": "2026-09-29T00:15:00Z",
+  "home_team": "Chicago Bears",
+  "away_team": "Philadelphia Eagles"
+ },
+ {
+  "id": "d55cb69fed50a09170560b5b75d8de86",
+  "sport_key": "americanfootball_nfl",
+  "sport_title": "NFL",
+  "commence_time": "2026-10-02T00:15:00Z",
+  "home_team": "Cleveland Browns",
+  "away_team": "Pittsburgh Steelers"
+ },
+ {
+  "id": "c9d8ed8aa4889486eaf10a630138ede0",
+  "sport_key": "americanfootball_nfl",
+  "sport_title": "NFL",
+  "commence_time": "2026-10-04T13:30:00Z",
+  "home_team": "Washington Commanders",
+  "away_team": "Indianapolis Colts"
+ },
+ {
+  "id": "664e6bda5721dc63be16bcf7d962a436",
+  "sport_key": "americanfootball_nfl",
+  "sport_title": "NFL",
+  "commence_time": "2026-10-04T17:00:00Z",
+  "home_team": "New York Giants",
+  "away_team": "Arizona Cardinals"
+ },
+ {
+  "id": "f01589b0e7e6dd4f4ac1220a1db81f53",
+  "sport_key": "americanfootball_nfl",
+  "sport_title": "NFL",
+  "commence_time": "2026-10-04T17:00:00Z",
+  "home_team": "Baltimore Ravens",
+  "away_team": "Tennessee Titans"
+ },
+ {
+  "id": "573cc0ef39631a4f6673ec843a8bedd4",
+  "sport_key": "americanfootball_nfl",
+  "sport_title": "NFL",
+  "commence_time": "2026-10-04T17:00:00Z",
+  "home_team": "Buffalo Bills",
+  "away_team": "New England Patriots"
+ },
+ {
+  "id": "164e6eb68f31bac190381903c3cccd31",
+  "sport_key": "americanfootball_nfl",
+  "sport_title": "NFL",
+  "commence_time": "2026-10-04T17:00:00Z",
+  "home_team": "Chicago Bears",
+  "away_team": "New York Jets"
+ },
+ {
+  "id": "2ea94ddf20f66432b9024fe2e2eaba5f",
+  "sport_key": "americanfootball_nfl",
+  "sport_title": "NFL",
+  "commence_time": "2026-10-04T17:00:00Z",
+  "home_team": "Cincinnati Bengals",
+  "away_team": "Jacksonville Jaguars"
+ },
+ {
+  "id": "daf55e2df5341c007fee5a0fc5bbc2d4",
+  "sport_key": "americanfootball_nfl",
+  "sport_title": "NFL",
+  "commence_time": "2026-10-04T17:00:00Z",
+  "home_team": "Houston Texans",
+  "away_team": "Dallas Cowboys"
+ },
+ {
+  "id": "99a9bae4dc0dc2590496bd3102b211f2",
+  "sport_key": "americanfootball_nfl",
+  "sport_title": "NFL",
+  "commence_time": "2026-10-04T17:00:00Z",
+  "home_team": "Tampa Bay Buccaneers",
+  "away_team": "Green Bay Packers"
+ },
+ {
+  "id": "1b4f2e60ce83fa1d63a5dff83769d27c",
+  "sport_key": "americanfootball_nfl",
+  "sport_title": "NFL",
+  "commence_time": "2026-10-04T17:00:00Z",
+  "home_team": "Philadelphia Eagles",
+  "away_team": "Los Angeles Rams"
+ },
+ {
+  "id": "c327223d76a3b7b0db8c6c104442f44b",
+  "sport_key": "americanfootball_nfl",
+  "sport_title": "NFL",
+  "commence_time": "2026-10-04T20:05:00Z",
+  "home_team": "Minnesota Vikings",
+  "away_team": "Miami Dolphins"
+ },
+ {
+  "id": "a7e7efb75a9792ac63480ae6328dca18",
+  "sport_key": "americanfootball_nfl",
+  "sport_title": "NFL",
+  "commence_time": "2026-10-04T20:25:00Z",
+  "home_team": "San Francisco 49ers",
+  "away_team": "Denver Broncos"
+ },
+ {
+  "id": "e0cbd266dcf997089203a1b33ba0333d",
+  "sport_key": "americanfootball_nfl",
+  "sport_title": "NFL",
+  "commence_time": "2026-10-04T20:25:00Z",
+  "home_team": "Las Vegas Raiders",
+  "away_team": "Kansas City Chiefs"
+ },
+ {
+  "id": "96d2373cda647873b971f268482bced0",
+  "sport_key": "americanfootball_nfl",
+  "sport_title": "NFL",
+  "commence_time": "2026-10-04T20:25:00Z",
+  "home_team": "Seattle Seahawks",
+  "away_team": "Los Angeles Chargers"
+ },
+ {
+  "id": "a73a76599a4f3422803e57bd8f61b626",
+  "sport_key": "americanfootball_nfl",
+  "sport_title": "NFL",
+  "commence_time": "2026-10-05T00:20:00Z",
+  "home_team": "Carolina Panthers",
+  "away_team": "Detroit Lions"
+ },
+ {
+  "id": "8bd90781e17e6d97df3941063cedae1e",
+  "sport_key": "americanfootball_nfl",
+  "sport_title": "NFL",
+  "commence_time": "2026-10-06T00:15:00Z",
+  "home_team": "New Orleans Saints",
+  "away_team": "Atlanta Falcons"
+ }
+]

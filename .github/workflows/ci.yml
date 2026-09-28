@@ -1,0 +1,82 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: parlaytracker
+          POSTGRES_PASSWORD: parlaytracker
+          POSTGRES_DB: parlaytracker_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U parlaytracker -d parlaytracker_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      TEST_DATABASE_URL: postgresql://parlaytracker:parlaytracker@localhost:5432/parlaytracker_test
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -e ".[dev]"
+      - run: ruff check .
+      - run: pytest
+
+  # The laptop deployment (SPEC.md section 12), minus Tailscale and systemd: build the image,
+  # start the stack with deploy/ as the laptop does, then prove a backup restores.
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      ROOT: ${{ github.workspace }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Lint the deploy scripts
+        run: shellcheck -x -P deploy deploy/*.sh
+      - name: Write a throwaway .env
+        run: |
+          cp deploy/env.example .env
+          sed -i -e "s/^POSTGRES_PASSWORD=.*/POSTGRES_PASSWORD=ci$(openssl rand -hex 12)/" \
+                 -e "s/^ALLOWED_LOGINS=.*/ALLOWED_LOGINS=ci@example.com/" .env
+      - name: Build and start
+        run: |
+          deploy/compose.sh build
+          deploy/compose.sh up -d
+      - name: The web app answers, on localhost only
+        run: |
+          for i in $(seq 1 60); do curl -fsS http://127.0.0.1:8501/_stcore/health && break; sleep 2; done
+          curl -fsS http://127.0.0.1:8501/_stcore/health
+          test "$(deploy/compose.sh port web 8501)" = "127.0.0.1:8501"
+      - name: The worker writes its heartbeat
+        run: |
+          for i in $(seq 1 30); do
+            n=$(deploy/compose.sh exec -T db psql -U parlaytracker -d parlaytracker -tAc \
+                "SELECT count(*) FROM source_health WHERE source = 'worker'")
+            [ "$n" = 1 ] && exit 0
+            sleep 2
+          done
+          exit 1
+      - name: A backup restores
+        run: |
+          q() { deploy/compose.sh exec -T db psql -U parlaytracker -d parlaytracker -tAc "$1"; }
+          q "INSERT INTO tags (category, name) VALUES ('ci', 'kept by the backup')"
+          sudo --preserve-env=ROOT deploy/backup.sh
+          q "DELETE FROM tags WHERE category = 'ci'"
+          dump=$(sudo ls -t /var/backups/parlaytracker | head -n1)
+          sudo --preserve-env=ROOT deploy/restore.sh "/var/backups/parlaytracker/$dump" --yes
+          test "$(q "SELECT count(*) FROM tags WHERE category = 'ci'")" = 1
+          for i in $(seq 1 60); do curl -fsS http://127.0.0.1:8501/_stcore/health && break; sleep 2; done
+          curl -fsS http://127.0.0.1:8501/_stcore/health
+      - name: Logs
+        if: failure()
+        run: deploy/compose.sh logs --no-color | tail -n 300

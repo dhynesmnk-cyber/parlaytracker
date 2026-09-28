@@ -1,0 +1,10 @@
+[Unit]
+Description=ParlayTracker: deploy the latest commit if it changed
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/default/parlaytracker
+ExecStart=/opt/parlaytracker/deploy/update.sh

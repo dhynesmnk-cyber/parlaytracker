@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "parlaytracker"
+version = "0.1.0"
+description = "Private two-user analytics for US sports betting Over markets (see SPEC.md)"
+requires-python = ">=3.12"
+# Only what the phases built so far need; each later phase adds its own (SPEC.md section 2.1).
+dependencies = [
+    "sqlalchemy>=2.0.30,<2.1",
+    "alembic>=1.13",
+    "psycopg[binary]>=3.1",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.7",
+    # Phase 2
+    "httpx>=0.27",
+    "streamlit>=1.42",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "respx>=0.21",
+    "ruff>=0.6",
+    "shellcheck-py>=0.10",
+]
+# A throwaway local Postgres without Docker: python scripts/dev_postgres.py
+localdb = [
+    "pgserver>=0.1.4",
+]
+
+[tool.setuptools.packages.find]
+include = ["parlaytracker*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+extend-exclude = ["migrations/versions"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "UP"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+markers = [
+    "db: needs a PostgreSQL database (TEST_DATABASE_URL)",
+    "live: calls a real external service; skipped unless run explicitly",
+]

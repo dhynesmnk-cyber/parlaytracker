@@ -1,19 +1,23 @@
-```
 # Dependencies
 .venv/
 venv/
 __pycache__/
 *.pyc
+*.egg-info/
 .mypy_cache/
 .pytest_cache/
+.ruff_cache/
 
-# Database
-parlaytracker.db
+# Databases and local Postgres data
+*.db
+.pgdata/
 
-# Environment
+# Secrets
 .env
 .env.local
 *.env.*
+!.env.example
+.streamlit/secrets.toml
 
 # Logs and temp files
 *.log
@@ -31,4 +35,3 @@ target/
 # OS
 .DS_Store
 Thumbs.db
-```
