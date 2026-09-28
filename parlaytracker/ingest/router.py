@@ -1,19 +1,24 @@
-"""Per-provider circuit breakers (SPEC.md section 8.3).
+"""Per-provider circuit breakers and the ESPN router (SPEC.md section 8.3).
 
-Phase 3 provides the breakers and their persistence to `source_health`. Phase 4 adds the ESPN
-router on top: host failover, integrity guards and raw samples.
+`Breakers` keeps one breaker per provider and persists it to `source_health`. `EspnRouter`
+sends each ESPN request to the first provider whose breaker isn't open, falls through to the
+next one in the same run, classifies every failure, and saves raw samples.
 """
 import logging
 import threading
 from collections import deque
 from collections.abc import Callable
-from datetime import UTC, datetime, timedelta
+from dataclasses import dataclass
+from datetime import UTC, date, datetime, timedelta
+from typing import Any
 
 from sqlalchemy import Engine
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
-from parlaytracker.core.models import FailureKind, HealthState, SourceHealth
+from parlaytracker.core.models import DataSource, FailureKind, HealthState, SourceHealth, Sport
+from parlaytracker.ingest import espn, guards
+from parlaytracker.ingest.http import FetchError, JsonResponse, RateLimited, get_json_response
 
 log = logging.getLogger("parlaytracker.breaker")
 
@@ -227,3 +232,168 @@ class Breakers:
             "errors_last_hour": errors, "last_error": b.last_error,
             "quota_remaining": b.quota_remaining,
         }
+
+
+# --- The ESPN router -------------------------------------------------------------------------
+
+MAX_SAMPLE_BYTES = 1_000_000
+
+
+@dataclass(frozen=True)
+class SampleRecord:
+    """A raw response worth keeping: a parse failure, or a recording of a watched event."""
+    source: str
+    reason: str  # "failure" or "recording"
+    url: str
+    status_code: int | None
+    espn_event_id: str | None
+    error: str | None
+    body: str
+
+
+class AllProvidersFailed(Exception):
+    """Every ESPN provider was skipped or failed. `errors` says why, per provider."""
+
+    def __init__(self, errors: dict[str, str], kind: FailureKind | None = None):
+        super().__init__("; ".join(f"{k}: {v}" for k, v in errors.items()) or "no provider")
+        self.errors = errors
+        self.kind = kind  # the last failure's kind, if any request actually failed
+
+
+@dataclass(frozen=True)
+class Routed[T]:
+    provider: DataSource
+    value: T
+
+
+# Which providers can answer which request, in order (section 6.1). The cdn host serves box
+# scores only.
+_SCORE_PROVIDERS = (DataSource.ESPN_WEB, DataSource.ESPN_SITE)
+_BOX_PROVIDERS = (DataSource.ESPN_WEB, DataSource.ESPN_SITE, DataSource.ESPN_CDN)
+_HOSTS = dict(espn.HOSTS)
+
+
+class EspnRouter:
+    """The worker builds one with the DB-backed `Breakers` and a sample sink; the web app has
+    its own with in-memory breakers."""
+
+    def __init__(self, breakers: Breakers, limiter=None,
+                 sample_sink: Callable[[SampleRecord], None] | None = None,
+                 record_event_ids: frozenset[str] | set[str] = frozenset()):
+        self._breakers = breakers
+        self._limiter = limiter or espn.LIMITER  # looked up now, so tests can swap it
+        self._sink = sample_sink
+        self._record = frozenset(record_event_ids)
+
+    @property
+    def breakers(self) -> Breakers:
+        return self._breakers
+
+    # --- public requests -------------------------------------------------------------------
+
+    def scoreboard(self, sport: Sport, day: date, max_wait: float = 0.0
+                   ) -> Routed[espn.ScoreboardResult]:
+        path = f"{espn.SPORT_PATHS[sport]}/scoreboard"
+
+        def check(result: espn.ScoreboardResult) -> None:
+            for g in result.games:
+                guards.check_score(sport, g.home_score)
+                guards.check_score(sport, g.away_score)
+
+        params = {"dates": day.strftime("%Y%m%d")}
+        return self._route(
+            _SCORE_PROVIDERS, lambda p, w: self._get_site(p, path, params, w),
+            lambda payload: espn.parse_scoreboard(sport, payload), check, max_wait,
+            recording_id=None, watch=self._record)
+
+    def box_score(self, sport: Sport, espn_event_id: str, max_wait: float = 0.0, *,
+                  only: DataSource | None = None) -> Routed[espn.BoxScore]:
+        """The box score from the first working provider, or from `only` (the canary)."""
+        path = f"{espn.SPORT_PATHS[sport]}/summary"
+
+        def fetch(provider: DataSource, wait: float) -> tuple[str, JsonResponse]:
+            if provider is DataSource.ESPN_CDN:
+                url = espn.CDN_URL.format(league=espn.CDN_LEAGUES[sport])
+                params = {"xhr": "1", "gameId": espn_event_id}
+                return url, get_json_response(url, params, self._limiter, wait)
+            return self._get_site(provider, path, {"event": espn_event_id}, wait)
+
+        def check(box: espn.BoxScore) -> None:
+            guards.check_score(sport, box.home_score)
+            guards.check_score(sport, box.away_score)
+            guards.check_stats(box.stats)
+
+        return self._route(_BOX_PROVIDERS, fetch,
+                           lambda payload: espn.parse_box_score(sport, payload), check, max_wait,
+                           recording_id=espn_event_id, only=only)
+
+    def roster(self, sport: Sport, team_id: str, max_wait: float = 0.0
+               ) -> Routed[list[espn.RosterPlayer]]:
+        path = f"{espn.SPORT_PATHS[sport]}/teams/{team_id}/roster"
+        return self._route(_SCORE_PROVIDERS, lambda p, w: self._get_site(p, path, None, w),
+                           espn.parse_roster, lambda _: None, max_wait, recording_id=None)
+
+    # --- internals -------------------------------------------------------------------------
+
+    def _get_site(self, provider: DataSource, path: str, params: dict[str, str] | None,
+                  wait: float) -> tuple[str, JsonResponse]:
+        url = f"{_HOSTS[provider]}{espn.BASE_PATH}/{path}"
+        return url, get_json_response(url, params, self._limiter, wait)
+
+    def _route[T](self, providers: tuple[DataSource, ...],
+                  fetch: Callable[[DataSource, float], tuple[str, JsonResponse]],
+                  parse: Callable[[Any], T], check: Callable[[T], None], max_wait: float,
+                  recording_id: str | None, watch: frozenset[str] = frozenset(),
+                  only: DataSource | None = None) -> Routed[T]:
+        errors: dict[str, str] = {}
+        limited = False
+        last_kind: FailureKind | None = None
+        for provider in providers:
+            if only is not None and provider is not only:
+                continue
+            source = provider.value
+            try:
+                self._breakers.allow(source)
+            except ProviderOpen as e:
+                errors[source] = str(e)
+                continue
+            url = ""
+            try:
+                url, response = fetch(provider, max_wait)
+            except RateLimited as e:
+                limited = True
+                errors[source] = str(e)
+                continue
+            except FetchError as e:
+                last_kind = e.kind
+                self._breakers.failure(source, e.kind, e.detail, e.retry_after)
+                errors[source] = str(e)
+                continue
+            try:
+                value = parse(response.data)
+                check(value)
+            except (espn.SchemaError, guards.ImplausibleError) as e:
+                kind = (FailureKind.SCHEMA if isinstance(e, espn.SchemaError)
+                        else FailureKind.IMPLAUSIBLE)
+                last_kind = kind
+                self._breakers.failure(source, kind, str(e))
+                self._save(source, "failure", url, response, None, str(e))
+                errors[source] = f"{kind}: {e}"
+                continue
+            self._breakers.success(source)
+            if recording_id in self._record or any(w in response.text for w in watch):
+                self._save(source, "recording", url, response, recording_id, None)
+            return Routed(provider, value)
+        if limited and last_kind is None:
+            raise RateLimited("espn", 0.0)  # skipped, not failed: the next run tries again
+        raise AllProvidersFailed(errors, last_kind)
+
+    def _save(self, source: str, reason: str, url: str, response: JsonResponse,
+              event_id: str | None, error: str | None) -> None:
+        if self._sink is None:
+            return
+        try:
+            self._sink(SampleRecord(source, reason, url, None, event_id, error,
+                                    response.text[:MAX_SAMPLE_BYTES]))
+        except Exception:
+            log.exception("could not save a raw sample")
