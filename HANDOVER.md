@@ -6,7 +6,7 @@ For the next agent picking up ParlayTracker. Read [SPEC.md](SPEC.md) first: it i
 
 | | |
 |---|---|
-| Branch | `claude/vigilant-sagan-acmryz` (no pull request opened yet) |
+| Branch | `claude/vigilant-sagan-acmryz`, open as [dhynesmnk-cyber/parlaytracker#4](https://github.com/dhynesmnk-cyber/parlaytracker/pull/4). New commits on the branch update the PR |
 | Done | Phase 0 (reset and tooling) and Phase 1 (core domain) of SPEC.md section 13 |
 | Next | Phase 2: logging UI, then deploy (below) |
 | Tests | 939 passing locally on Python 3.12 + PostgreSQL 16: 903 unit, 36 database |
