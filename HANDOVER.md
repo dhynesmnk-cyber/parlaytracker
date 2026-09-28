@@ -7,12 +7,12 @@ For the next agent picking up ParlayTracker. Read [SPEC.md](SPEC.md) first: it i
 | | |
 |---|---|
 | Code | All on `main`. Phases 0–2 were merged in [dhynesmnk-cyber/parlaytracker#4](https://github.com/dhynesmnk-cyber/parlaytracker/pull/4). Work on a branch, and open a PR into `main`: the laptop deploys whatever is merged there |
-| Done | Phases 0 and 1, and the **code** for Phases 2, 3 and 4 (SPEC.md section 13). Phases 3 and 4 are on branch `claude/elegant-pasteur-0qqx5i`, not yet merged |
+| Done | Phases 0, 1 and 5 (SPEC.md section 13), and the **code** for Phases 2, 3 and 4. Phases 3, 4 and 5 are on branch `claude/elegant-pasteur-0qqx5i`, not yet merged |
 | Phase 2 still open | Its exit criteria need the real laptop: install it, log real slips from both phones over Tailscale, reboot, update, and restore a backup once (below) |
 | Phase 3 still open | Its exit criteria need a real game day with logged slips (below) |
 | Phase 4 still open | Its exit criteria need a real weekend of games (below) |
-| Next after that | Phase 5: analytics (then 6: screenshots, 7: live tracking) |
-| Tests | 1,281 passing locally on Python 3.12 + PostgreSQL 16 (unit, database and Streamlit app tests), plus 2 `live` tests (`-m live`, 0 credits) |
+| Next after that | Phase 6: screenshot extraction (then 7: live tracking) |
+| Tests | 1,374 passing locally on Python 3.12 + PostgreSQL 16 (unit, database and Streamlit app tests), plus 2 `live` tests (`-m live`, 0 credits) |
 | CI | Two jobs on every push: `test` (ruff + pytest against Postgres 16) and `deploy` (build the image, run the Compose stack as on the laptop, check web + worker, restore a backup). See the CI section at the end |
 | Hosting | A dedicated laptop at home with Docker Compose, reachable only over Tailscale (section 12) |
 | AI | Qwen through OpenRouter (section 6.3); not needed until Phase 6 |
@@ -26,7 +26,8 @@ For the next agent picking up ParlayTracker. Read [SPEC.md](SPEC.md) first: it i
 | `parlaytracker/core/services.py` | The only write path. Phase 1: `create_slip`, `find_duplicates`, `slip_warnings`. Phase 2: `upsert_event`, `settle_leg_manually`, `reopen_leg`, `refresh_slip`, `enter_slip_payout`, `mark_cashed_out`, `set_closing_line`, `review_queue`/`review_count`, tag and sportsbook management, and read helpers (`sportsbooks`, `all_tags`, `open_slips`, `recent_slips`, `event_ids_for`) |
 | `parlaytracker/ingest/http.py` | Shared httpx client (`ParlayTracker/1.0`, no cookies), `RateLimiter`, and `FetchError` with a `FailureKind` for every failure |
 | `parlaytracker/ingest/espn.py` | Box-score parser (`parse_box_score`: summary and cdn documents, read by column key), scoreboard and roster parsers (Pydantic-validated, per-event errors), status mapping, US Eastern game days, and host failover (`site.web.api` → `site.api`). Not yet routed through the breakers in `router.py`: that is Phase 4 |
-| `parlaytracker/app/` | Streamlit app: `main.py` (navigation, auth, health banner), `auth.py` (Tailscale guard), `common.py`, `components/slip_form.py`, `pages/log.py`, `review.py`, `settings.py` |
+| `parlaytracker/core/analytics.py` | Pure analytics over `LegRow` / `SlipRow` (section 10): hit rate + Wilson interval, break-even, flat ROI, price and line CLV, dedupe, every dimension and filter, slip money. `load_leg_rows` / `load_slip_rows` fill the rows from Postgres |
+| `parlaytracker/app/` | Streamlit app: `main.py` (navigation, auth, health banner), `pages/analytics.py`, `auth.py` (Tailscale guard), `common.py`, `components/slip_form.py`, `pages/log.py`, `review.py`, `settings.py` |
 | `parlaytracker/ingest/router.py` | `EspnRouter` (first provider whose breaker isn't open, falls through in the same run, classifies every failure, keeps raw samples, records watched events; the web app uses one too, with in-memory breakers), `CircuitBreaker` (one per provider, section 8.3 rules) and `Breakers`, which writes every transition to `source_health` at once and the hourly counters at each heartbeat, and restores open breakers and the Odds API quota on restart. The ESPN failover router is Phase 4 |
 | `parlaytracker/ingest/guards.py` | Pure integrity rules: progress key, stale / correction / advance, final never goes back to play, frozen-feed and probe rules, plausibility bounds. Frozen-feed *use* (the probe) is Phase 7 |
 | `parlaytracker/ingest/nflverse.py` | `NflverseData`: schedules, players, weekly stats and snap counts through `nflreadpy`, mapped only by ID, loaded once per job run, failures through the `nflverse` breaker |
@@ -72,7 +73,16 @@ For the next agent picking up ParlayTracker. Read [SPEC.md](SPEC.md) first: it i
 17. **`check_finals` also covers NFL until Phase 7** (the spec says NBA/NHL/MLB only). Without `poll_nfl_live` nothing else would ever mark an NFL game final. It starts 3 h after kickoff, every 15 min.
 18. **`apply_event_reading` compares a box score (no period or clock) as if the event hadn't moved**; otherwise a final box score would look older than the scoreboard's final and be discarded as stale.
 19. **Values in Review messages are normalised** (`fmt`): the database keeps `Numeric(8,1)`, so a stored 25 reads back as 25.0.
-20. **Dependencies:** each phase adds its own. Phase 3 added `apscheduler<4` and `rapidfuzz`, Phase 4 `nflreadpy` (which brings polars, pandas and pyarrow: the image is larger); later phases need `pandas`, `plotly`, `Pillow`, `openai` and `nflreadpy`.
+21. **Analytics definitions** (SPEC.md section 10, plus what it left open):
+    - The unit is a settled non-`other` leg, deduplicated by selection key (earliest logged wins, across both users). **Voids are dropped** (a refunded bet that never happened); **pushes are kept but are neither a win nor a loss**, and are shown in their own column.
+    - Hit rate is wins / (wins + losses). ROI stakes one unit on each win or loss *that has odds*; pushes stake nothing.
+    - **Both sample sizes are shown**: `n` (decided legs) and the number with odds, which break-even, ROI and price CLV use.
+    - **Price CLV** needs the closing line to equal the line taken; **line CLV** is only counted for legs whose line moved (a leg that closed on the same line has no line CLV, rather than a zero that would dilute the mean). They are separate columns, each with its own n.
+    - "Low sample" is `wins + losses < MIN_SAMPLE`. The evidence column says "interval above break-even" only when the whole Wilson interval (over the legs with odds) clears break-even.
+    - Weekday, month and start window are of the **Eastern** game day. Lead time has a fifth bucket, "logged after the start", which the spec doesn't list.
+    - The multiple-comparisons caution appears once more than two slices are applied; tags count as one slice.
+    - The group-by selectbox uses the string `"all"`, not `None`: Streamlit reads `None` as "nothing selected".
+22. **Dependencies:** each phase adds its own. Phase 3 added `apscheduler<4` and `rapidfuzz`, Phase 4 `nflreadpy` (which brings polars, pandas and pyarrow: the image is larger); later phases need `pandas`, `plotly`, `Pillow`, `openai` and `nflreadpy`.
 
 ## Gotchas
 
@@ -124,6 +134,13 @@ export TEST_DATABASE_URL="$(.venv/bin/python scripts/dev_postgres.py)"
 - **ESPN and nflverse agree on real data:** all 18 receiving lines in ARI @ SF match nflverse's weekly stats.
 - **Mutation checks:** breaking the disagreement comparison and the Tuesday deadline each made the intended tests fail.
 
+## Checked by hand in Phase 5
+
+- **Against the spec's own numbers:** 18 wins from 30 at -110 reads 60.0% (42-75%) against a 52.4% break-even and "not yet evidence of an edge"; Over -110 closing at Over -125 / Under +105 is +0.87 pp of price CLV; Over 45.5 closing at 47.5 is +2.0 of line CLV.
+- **End to end:** real slips created through `create_slip`, settled and closed through the services, then summarised: hit rate, ROI, break-even and both CLV figures match hand calculation.
+- **Mutation checks:** flipping the alt-spread sign, keeping the latest duplicate instead of the earliest, and an off-by-one in the low-sample threshold each made the intended tests fail.
+- **Not looked at in a browser:** the page is exercised through `AppTest`. Greying is tested on the styled frame's CSS, not by eye. Worth a glance on a phone once there is real data.
+
 ## Next steps
 
 **Phase 2, on the laptop (needs the user):**
@@ -153,7 +170,9 @@ export TEST_DATABASE_URL="$(.venv/bin/python scripts/dev_postgres.py)"
 4. Look at `source_health` and the banner for the breakers, and `raw_samples` for anything the parsers rejected. `python -m parlaytracker.cli export-sample <id> <path>` turns a sample into a fixture.
 5. Statuses still **to verify on a live game** (SPEC.md section 15): the halftime and delay names, and the live `period`/`clock` fields. That is Phase 7's recording.
 
-**Phase 5 (can start now):** analytics (section 10), built on seeded data first. `services` has no analytics yet; `core/analytics.py` is new.
+**Phase 5 is done** (its exit is test-verifiable and passes). Look at the page with real data once a few games have settled; the interesting number early on is CLV, not ROI.
+
+**Phase 6 (can start now):** screenshot extraction (section 13): `extraction.py`, `resolve.py` (sportsbook and market wording, event and team aliases) and the Screenshot page, with Qwen through OpenRouter. The exit needs 10 real slips from at least 2 sportsbooks and a `QWEN_API_KEY`, which only the user can supply.
 
 ## Needs the user
 
