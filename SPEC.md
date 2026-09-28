@@ -28,6 +28,7 @@ Priorities, in order:
 | Hosting | A small always-on budget is accepted: web process, worker process and Postgres |
 | AI | Qwen models via Alibaba Cloud Model Studio only. No Anthropic models |
 | Frontend | Streamlit only |
+| Live tracking | NFL only. NBA, NHL and MLB slips are logged and settled after the game, but not tracked during it |
 | Data ingestion | Polling only |
 | Sports and odds data | Free sources only, and no scraping |
 
@@ -68,8 +69,9 @@ Sports: NFL, NBA, MLB, NHL.
 browser ──▶ web (Streamlit) ──▶ Qwen vision API      (screenshot upload only)
                  │           ──▶ ESPN                 (game and roster pickers, cached)
                  ▼
-            PostgreSQL ◀────── worker (APScheduler) ──▶ ESPN          (scores, box scores)
-                                                    ──▶ The Odds API  (closing lines)
+            PostgreSQL ◀────── worker (APScheduler) ──▶ ESPN, with host failover  (NFL live; finals for all sports)
+                                                    ──▶ nflverse                  (next-day NFL verification)
+                                                    ──▶ The Odds API              (closing lines)
 ```
 
 - There are two processes and one database. The processes share nothing except Postgres.
@@ -87,8 +89,9 @@ browser ──▶ web (Streamlit) ──▶ Qwen vision API      (screenshot upl
 - httpx for all outbound HTTP
 - The `openai` SDK, used for Qwen's OpenAI-compatible endpoint
 - rapidfuzz, pandas, plotly, Pillow, pydantic ≥ 2, pydantic-settings
+- `nflreadpy`, used only for next-day NFL verification (section 6.4)
 - Dev: pytest, respx, ruff
-- **Not used:** FastAPI, streamlit-autorefresh, nfl_data_py, nba_api, Playwright
+- **Not used:** FastAPI, streamlit-autorefresh, nfl_data_py (deprecated), nba_api, Playwright
 
 ### 2.2 Layout
 
@@ -104,8 +107,11 @@ parlaytracker/
     analytics.py     # aggregation functions (section 10)
     services.py      # the ONLY functions that write slips and legs
   ingest/
-    http.py          # shared httpx client, timeouts, per-source backoff (section 8.3)
+    http.py          # shared httpx client, headers, timeouts, rate limiter (section 8.3)
+    router.py        # per-provider circuit breakers and ESPN host failover (section 8.3)
+    guards.py        # progress key, plausibility bounds, freeze detection (section 8.3)
     espn.py          # client + parsers returning typed dataclasses
+    nflverse.py      # nflreadpy loaders and ESPN ID mapping (section 6.4)
     odds_api.py      # client + parsers
     extraction.py    # Qwen call + ExtractedSlip parsing
     resolve.py       # alias tables (markets, teams, sportsbooks) and player fuzzy matching
@@ -117,6 +123,7 @@ parlaytracker/
     auth.py
     components/slip_form.py   # the ONE slip form, used by both Log and Screenshot
     pages/log.py  screenshot.py  live.py  analytics.py  review.py  settings.py
+  cli.py             # maintenance commands, e.g. export a raw sample as a test fixture
 migrations/          # Alembic
 scripts/start-web.sh # writes .streamlit/secrets.toml from env, then execs streamlit
 tests/
@@ -142,6 +149,7 @@ Rules:
 | `DASHSCOPE_BASE_URL` | no | Default `https://dashscope-intl.aliyuncs.com/compatible-mode/v1` |
 | `QWEN_VISION_MODEL` | no | Default `qwen-vl-max`. Model names change, so check Model Studio |
 | `MIN_SAMPLE` | no | Default 30 (section 10.3) |
+| `RECORD_EVENT_IDS` | no | Comma-separated ESPN event IDs. Every response for these events is saved to `raw_samples` (section 8.3) |
 | Auth values | yes | Section 9.1 |
 
 - Every timestamp is stored in UTC (`timestamptz`) and converted to `DISPLAY_TZ` only in the UI.
@@ -159,6 +167,7 @@ Design notes:
 - Money is `Numeric(12,2)`, lines are `Numeric(6,1)` and odds are integer American odds.
 - The database enforces the invariants it can through the CHECK constraints below. The Pydantic models in section 5 enforce the rest before any write.
 - Screenshot images are not stored.
+- Every live, settled and verified value records which provider it came from (`live_source`, `settlement_source`, `verified_source`).
 - Tags attach to legs and are for subjective context only. Section 10.2 lists the dimensions that already exist as columns; these must never be tagged.
 
 The code below has been run against PostgreSQL 16 (and SQLite): every valid case is accepted, and every constraint and validation case listed in section 11 is rejected.
@@ -169,7 +178,7 @@ from datetime import datetime
 from decimal import Decimal
 
 from sqlalchemy import (
-    CheckConstraint, Column, DateTime, Enum, ForeignKey, MetaData, Numeric,
+    CheckConstraint, Column, DateTime, Enum, ForeignKey, Index, MetaData, Numeric,
     String, Table, Text, UniqueConstraint, func,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
@@ -235,9 +244,34 @@ class SlipStatus(enum.StrEnum):
 class EventStatus(enum.StrEnum):
     SCHEDULED = "scheduled"
     IN_PROGRESS = "in_progress"
+    BREAK = "break"      # halftime, end of period
+    DELAYED = "delayed"  # weather or other stoppage
     FINAL = "final"
     POSTPONED = "postponed"
     CANCELLED = "cancelled"
+
+
+class DataSource(enum.StrEnum):
+    ESPN_WEB = "espn_web"    # site.web.api.espn.com
+    ESPN_SITE = "espn_site"  # site.api.espn.com
+    ESPN_CDN = "espn_cdn"    # cdn.espn.com (only if verified, section 15)
+    NFLVERSE = "nflverse"
+    MANUAL = "manual"
+
+
+class HealthState(enum.StrEnum):
+    OK = "ok"
+    DEGRADED = "degraded"  # recent failures, breaker still closed
+    OPEN = "open"          # breaker open until open_until
+
+
+class FailureKind(enum.StrEnum):
+    TRANSIENT = "transient"
+    BLOCKED = "blocked"
+    THROTTLED = "throttled"
+    SCHEMA = "schema"
+    IMPLAUSIBLE = "implausible"
+    FROZEN = "frozen"
 
 
 class EntrySource(enum.StrEnum):
@@ -282,8 +316,11 @@ class Event(Base):
         _enum(EventStatus, "event_status"), default=EventStatus.SCHEDULED)
     home_score: Mapped[int | None]
     away_score: Mapped[int | None]
+    period: Mapped[int | None]         # progress key (section 8.3); OT is period >= 5
+    clock_seconds: Mapped[int | None]  # game clock remaining in the period
     final_at: Mapped[datetime | None] = mapped_column(TZ)
     last_polled_at: Mapped[datetime | None] = mapped_column(TZ)
+    last_progress_at: Mapped[datetime | None] = mapped_column(TZ)  # progress key last advanced
     last_error: Mapped[str | None] = mapped_column(Text)
 
     legs: Mapped[list["Leg"]] = relationship(back_populates="event")
@@ -354,8 +391,14 @@ class Leg(Base):
         _enum(LegResult, "leg_result"), default=LegResult.PENDING)
     live_value: Mapped[Decimal | None] = mapped_column(Numeric(8, 1))
     live_updated_at: Mapped[datetime | None] = mapped_column(TZ)
+    live_source: Mapped[DataSource | None] = mapped_column(_enum(DataSource, "live_source"))
     final_value: Mapped[Decimal | None] = mapped_column(Numeric(8, 1))
     settled_at: Mapped[datetime | None] = mapped_column(TZ)
+    settlement_source: Mapped[DataSource | None] = mapped_column(
+        _enum(DataSource, "settlement_source"))
+    verified_at: Mapped[datetime | None] = mapped_column(TZ)  # a second source agreed
+    verified_source: Mapped[DataSource | None] = mapped_column(
+        _enum(DataSource, "verified_source"))
     closing_line: Mapped[Decimal | None] = mapped_column(Numeric(6, 1))
     closing_odds: Mapped[int | None]
     closing_opposite_odds: Mapped[int | None]  # the Under / other side, for no-vig CLV
@@ -383,17 +426,48 @@ class Leg(Base):
             "market_type = 'other' OR line IS NOT NULL", name="line_required"),
         CheckConstraint(
             "market_type <> 'other' OR description IS NOT NULL", name="other_has_description"),
+        CheckConstraint(
+            "(result = 'pending') = (settlement_source IS NULL)", name="settled_has_source"),
+        CheckConstraint(
+            "(verified_at IS NULL) = (verified_source IS NULL)", name="verified_pair"),
     )
 
 
 class SourceHealth(Base):
     __tablename__ = "source_health"
-    source: Mapped[str] = mapped_column(String(30), primary_key=True)  # "espn", "odds_api"
+    # One row per provider: "espn_web", "espn_site", "espn_cdn", "nflverse", "odds_api",
+    # plus "worker" for the heartbeat. Written by the worker, read by the UI banner.
+    source: Mapped[str] = mapped_column(String(30), primary_key=True)
+    state: Mapped[HealthState] = mapped_column(
+        _enum(HealthState, "health_state"), default=HealthState.OK)
+    failure_kind: Mapped[FailureKind | None] = mapped_column(_enum(FailureKind, "failure_kind"))
+    open_until: Mapped[datetime | None] = mapped_column(TZ)
     last_success_at: Mapped[datetime | None] = mapped_column(TZ)
     last_failure_at: Mapped[datetime | None] = mapped_column(TZ)
     consecutive_failures: Mapped[int] = mapped_column(default=0)
+    requests_last_hour: Mapped[int] = mapped_column(default=0)
+    errors_last_hour: Mapped[int] = mapped_column(default=0)
     last_error: Mapped[str | None] = mapped_column(Text)
     quota_remaining: Mapped[int | None]  # Odds API x-requests-remaining
+
+
+class RawSample(Base):
+    """Raw response bodies: parse failures (last 5 per source) and recordings (section 8.3)."""
+    __tablename__ = "raw_samples"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    source: Mapped[str] = mapped_column(String(30))
+    reason: Mapped[str] = mapped_column(String(20))  # "failure" or "recording"
+    url: Mapped[str] = mapped_column(Text)
+    status_code: Mapped[int | None]
+    espn_event_id: Mapped[str | None] = mapped_column(String(20))
+    error: Mapped[str | None] = mapped_column(Text)
+    body: Mapped[str] = mapped_column(Text)  # truncated to 1 MB before insert
+    fetched_at: Mapped[datetime] = mapped_column(TZ, server_default=func.now())
+
+    __table_args__ = (
+        CheckConstraint("reason IN ('failure', 'recording')", name="reason_valid"),
+        Index("ix_raw_samples_source_fetched_at", "source", "fetched_at"),
+    )
 ```
 
 Alembic:
@@ -536,9 +610,20 @@ The form also shows these **warnings**. They do not block saving:
 
 ### 6.1 ESPN: schedules, scores, box scores, rosters
 
-This API is unofficial, free and needs no key. One parser covers all four sports.
+This API is unofficial, free and needs no key. One parser covers all four sports. ESPN has been tightening access:
+- In August 2026, `site.api.espn.com` began answering some clients with 403 "You don't have permission". Switching to `site.web.api.espn.com`, or replacing a browser User-Agent with a non-browser one, fixed it.
+- Frequent polling also produced 403s.
+- In September 2026, date-range queries (`dates=A-B`) stopped working. Single dates still work.
 
-Base URL: `https://site.api.espn.com/apis/site/v2/sports`
+So the same paths are served from several hosts, each treated as its own provider with its own circuit breaker (section 8.3). All hosts share ESPN's backend, so failover covers a host-level block but not a full ESPN outage. For NFL results, nflverse (section 6.4) is the independent second source.
+
+| Provider | Host | Order |
+|---|---|---|
+| `espn_web` | `site.web.api.espn.com` | Primary |
+| `espn_site` | `site.api.espn.com` | Fallback |
+| `espn_cdn` | `cdn.espn.com/core/{league}/game?xhr=1&gameId={id}` | Third, **only if verified** (section 15): believed to wrap the summary JSON in `gamepackageJSON`. Unwrap it and reuse the summary parser |
+
+Paths on the first two hosts (prefix `/apis/site/v2/sports`):
 
 | Use | Path |
 |---|---|
@@ -548,11 +633,22 @@ Base URL: `https://site.api.espn.com/apis/site/v2/sports`
 
 `{sport}/{league}` is one of `football/nfl`, `basketball/nba`, `baseball/mlb` or `hockey/nhl`.
 
-Rules:
-- **Record real responses as fixtures in `tests/fixtures/espn/` before writing any parser.** For each sport, record at least one scheduled, one in-progress, one final, one overtime and one postponed game. Also record an NFL box score in which a player who played has zero receptions.
+Request rules (enforced in `http.py`, for both web and worker):
+- **User-Agent:** a fixed, honest, non-browser string: `ParlayTracker/1.0`. Never a spoofed browser string.
+- **Headers:** `Accept: application/json` and gzip. Use one shared client with keep-alive, and no cookies.
+- **Dates:** single `dates=YYYYMMDD` only. Never ranges.
+- **Rate limits:** at most 1 request every 2 seconds per host, and at most 20 requests a minute to ESPN overall. A request over the limit is skipped until the next run, never queued.
+
+Rules for parsers:
+- **Record real responses as fixtures in `tests/fixtures/espn/` before writing any parser.** For each sport, record at least one scheduled, one in-progress, one final, one overtime and one postponed game. For the NFL, also record:
+  - a halftime game and a weather-delayed game;
+  - a box score in which a player who played has zero receptions;
+  - an Akamai "Access Denied" 403 body, which is HTML, not JSON.
 - Parse player stats by the column `keys` or `labels` arrays, never by position.
+- Validate the part of each response you use with a Pydantic model, so a format change raises a `schema` failure (section 8.3) instead of producing wrong values.
 - The parser returns typed dataclasses. Nothing outside `espn.py` touches raw JSON.
 - Treat every field as optional. A missing field is a parse error for that event only.
+- Map ESPN's status to `EventStatus`: halftime and end of period become `break`, and weather or other stoppages become `delayed`.
 
 Stat mapping. Confirm each column against the fixtures:
 
@@ -565,7 +661,16 @@ Stat mapping. Confirm each column against the fixtures:
 | `player_points` (NBA) | player stats | PTS |
 | `player_points` (NHL) | skater stats | G + A, or PTS if present |
 
-**Known trap:** an NFL player who played but made no receptions does not appear in the receiving table at all. Absence therefore means neither zero nor void; the leg goes to Review (section 7.1).
+Plausibility bounds. A response with any value outside these is rejected as `implausible` (section 8.3):
+
+| Value | Allowed range |
+|---|---|
+| NFL team score | 0 to 99 |
+| Rushing or receiving yards | −30 to 400 |
+| Passing yards | −30 to 700 |
+| Receptions | 0 to 25 |
+
+**Known trap:** an NFL player who played but made no receptions does not appear in the receiving table at all. Absence therefore means neither zero nor void. Section 7.1 settles it from snap-count evidence, or sends it to Review.
 
 ### 6.2 The Odds API: closing lines only
 
@@ -607,6 +712,26 @@ Matching:
 - Mapping sportsbook wording to `MarketType` is done by the alias table in `resolve.py`, not by another model call.
 - Cost is per token: fractions of a cent per slip at this volume, but not zero. The upload page sits behind login, so nobody else can spend it.
 
+### 6.4 nflverse: independent NFL results
+
+nflverse publishes NFL data built from the league's own game data, independent of ESPN. It is free, and it is downloaded from GitHub releases through `nflreadpy`. It is not live: it is published overnight, and complete weekly stats are expected by Tuesday. Confirm the timing (section 15).
+
+It is used only by the worker, for two jobs:
+- **checking** every NFL leg the next day (`verify_nfl`, section 7.1);
+- **settling** NFL legs when ESPN can't provide a final box score.
+
+| Dataset (`nflreadpy`) | Used for | ESPN link |
+|---|---|---|
+| `load_schedules()` | Final scores | `espn` column = ESPN event ID |
+| `load_players()` | Player ID mapping | `espn_id` ↔ `gsis_id` |
+| `load_player_stats()` (weekly) | Receptions, receiving, rushing and passing yards | Via `gsis_id` |
+| `load_snap_counts()` | Did the player take a snap? | Via the players table's PFR ID |
+
+Rules:
+- Map players only through these ID columns; never by name. A leg whose player can't be mapped stays unverified. That is shown in the UI, but not added to the Review queue.
+- Load each dataset at most once per job run, and cache it in memory for that run.
+- Store small slices of each dataset in `tests/fixtures/nflverse/` for tests.
+
 ---
 
 ## 7. Settlement
@@ -631,13 +756,29 @@ Required test table (numbers verified):
 | `alt_spread` | +3.5 | margin −4 | loss |
 | `alt_spread` | −7 | margin 7 | push |
 
-Rules:
-- **A leg settles only when its event is final.** Live values are for display and never settle anything, because yardage can fall (negative plays, penalties, stat corrections) and margins swing both ways.
+Rules for every sport:
+- **A leg settles only after its event has been final for at least 10 minutes.** Live values are for display and never settle anything, because yardage can fall (negative plays, penalties, stat corrections) and margins swing both ways. The 10-minute gate gives the stat crew time to finish, and stops a single glitched "final" from settling anything.
 - Final scores include overtime and extra innings.
-- **Player missing from the relevant box-score table at final:** set `needs_review` with the reason "No stat line: enter 0 or void". Never void automatically, and never assume zero.
+- `settlement_source` records where the value came from: the ESPN provider that served the box score, `nflverse`, or `manual`.
 - **Event postponed or cancelled, or not final 8 hours after its start:** set `needs_review`.
 - **`other` legs:** set `needs_review` ("Settle manually") once their event is final.
-- **Stat corrections:** 24 hours after a leg settles, the worker re-reads the box score once. If the value has changed, set `needs_review` with "Stat correction: was X, now Y". The worker never changes a settled result by itself.
+- **The worker never changes a settled result by itself.** Any disagreement goes to Review.
+
+**Player missing from the relevant box-score table at final.** Never void automatically, and never assume zero without evidence.
+- **NFL:** the leg stays pending until `verify_nfl` runs (below). Then:
+  - if nflverse has a stat line, settle from it (`settlement_source = 'nflverse'`);
+  - if neither source has a stat line, but snap counts show the player took at least one snap, settle with value 0 and reason "Played, no stat". The player took part, so the prop has action;
+  - if there are zero snaps, or still no snap data after the Tuesday following the game, set `needs_review` with "No stat line and no snaps: likely void".
+- **NBA and NHL:** set `needs_review` with "No stat line: enter 0 or void".
+
+**NFL verification (`verify_nfl`, daily at 10:00 ET, after nflverse's overnight publish).** For every NFL leg that settled in the last 7 days and is not yet verified, compare it with nflverse (section 6.4). For team markets compare the final scores; for player markets compare the stat.
+- **Agree:** set `verified_at` and `verified_source = 'nflverse'`.
+- **Disagree:** set `needs_review` with "Sources disagree: ESPN X, nflverse Y". This also catches stat corrections.
+- **Still missing after the Tuesday following the game:** leave it unverified. The UI shows this, but it doesn't go into Review.
+
+**ESPN unavailable.** If no ESPN provider has returned a final box score 6 hours after an NFL game's expected end (start + 4 hours), `verify_nfl` settles the legs from nflverse once its schedule shows a final score. Those legs stay unverified, because no second source agreed.
+
+**Stat corrections for NBA, NHL and MLB.** 24 hours after a leg settles, the worker re-reads the ESPN box score once. If the value has changed, set `needs_review` with "Stat correction: was X, now Y".
 
 ### 7.2 Slips
 
@@ -680,16 +821,30 @@ Port the existing test cases from `tests/test_math_calculator.py` before deletin
 - Every job body is wrapped in a try/except that logs and records the error. A job never raises into the scheduler.
 - When there is nothing to do, a job costs one cheap query.
 
-An **active event** has status `scheduled` or `in_progress`, a start time between 8 hours ago and 10 minutes from now, and at least one pending leg.
+An **active NFL event** is an NFL event with at least one pending leg, whose status is not `final`, `postponed` or `cancelled`, and whose start time is between 8 hours ago and 30 minutes from now. Only NFL is tracked live (section 1.1).
 
-| Job | Every | What it does |
+| Job | Runs | What it does |
 |---|---|---|
-| `heartbeat` | 60 s | Upserts `source_health('worker').last_success_at` |
-| `capture_closing` | 60 s | Section 8.2 |
-| `poll_scoreboards` | 30 s | One ESPN scoreboard call per (sport, game day) that has active events. Updates status and scores, and sets `live_value` on `game_total`, `team_total` and `alt_spread` legs |
-| `poll_player_stats` | 60 s | For each in-progress event with pending player legs, one summary call, then sets `live_value` |
-| `settle` | 5 min | For final events with pending legs: summary call, settle the legs (7.1), then settle their slips (7.2). Also flags postponed and stale events |
-| `recheck_settled` | 1 h | Re-reads legs settled 24–25 hours ago (7.1) |
+| `heartbeat` | every 60 s | Upserts `source_health('worker')`, and writes each provider's breaker state and hourly counters to `source_health` |
+| `capture_closing` | every 60 s | Section 8.2 |
+| `poll_nfl_live` | ticks every 30 s | Makes whichever calls are due under the cadence table below. Updates event status, scores and progress key (8.3), and sets `live_value` and `live_source` on legs |
+| `check_finals` | every 15 min | NBA, NHL and MLB only. From start + 2.5 h (NBA) or start + 3 h (NHL, MLB) until each event is final: one scoreboard call per sport per game day with pending legs |
+| `settle` | every 5 min | Events that have been final for at least 10 minutes and still have pending legs: summary call, settle the legs (7.1), then their slips (7.2). Also flags postponed and stale events |
+| `verify_nfl` | daily at 10:00 ET | Section 7.1: check NFL legs against nflverse, and settle from nflverse when ESPN couldn't |
+| `recheck_settled` | every 1 h | NBA, NHL and MLB legs settled 24–25 hours ago (7.1) |
+| `canary` | at startup, and daily at 09:00 ET | Fully parses the latest completed NFL game from every ESPN provider, and loads the nflverse datasets. A failure opens that provider's breaker with its failure kind (8.3), so the banner shows it before the next game day |
+| `prune_samples` | daily | Keeps the last 5 failure samples per provider; deletes recordings older than 30 days |
+
+Cadence for each active NFL event. One scoreboard call covers every NFL game that day, and it is fetched at the shortest interval any active game needs:
+
+| Game state | Scoreboard | Box score (`summary`) |
+|---|---|---|
+| `scheduled`, from 30 min before kickoff | every 5 min | none |
+| `in_progress` | every 30 s | every 60 s, only if the event has pending player legs |
+| `break` or `delayed` | every 2 min | every 3 min |
+| `final`, `postponed`, `cancelled` | stop; `settle` takes over | stop |
+
+Worst case: a 14-game Sunday with player props in 5 games is about 7 ESPN requests a minute, well inside the limits in section 6.1.
 
 **Single instance:** at startup the worker takes `pg_try_advisory_lock` on a dedicated connection that it holds for the life of the process. If the lock is already held, it exits. Two workers would poll twice and spend Odds API credits twice.
 
@@ -712,10 +867,57 @@ Closing lines cannot be backfilled, because historical odds are not affordable, 
 
 ### 8.3 Failure handling
 
-- **HTTP:** use one shared httpx client with `timeout=httpx.Timeout(10, connect=5)` and a descriptive User-Agent. Jobs never retry internally; the schedule is the retry.
-- **Backoff is per source** (`espn`, `odds_api`), not per game. After the nth consecutive failure, skip that source for `min(30 s × 2^(n−1), 5 min)`. Reset on success. Never stop permanently while events are active.
-- **Recording:** record every success and failure in `source_health`. A parse error for one event goes in `events.last_error` and does not stop other events updating.
-- **Visibility:** log to stdout, where Fly collects it. But failures must be visible in the **UI** (sections 9.2 and 9.4), not only in the logs.
+**HTTP.** Use one shared httpx client with `timeout=httpx.Timeout(10, connect=5)`, plus the headers and rate limits in section 6.1. Jobs never retry internally; the schedule is the retry.
+
+**Circuit breaker: one per provider** (`espn_web`, `espn_site`, `espn_cdn`, `nflverse`, `odds_api`).
+- **Closed:** normal use.
+- **Open:** the provider is skipped until `open_until`.
+- **Half-open:** once `open_until` passes, the next request is a trial. Success closes the breaker and resets its counters. Failure reopens it for the next duration.
+
+A breaker always half-opens again, so no provider is ever abandoned for good. Every failure is classified:
+
+| Response | `failure_kind` | Breaker action |
+|---|---|---|
+| Timeout, connection error, 5xx, or a 200 that isn't JSON or is truncated | `transient` | Open after 3 consecutive failures, for 30 s, doubling each time up to 5 min |
+| 403, including Akamai's HTML "Access Denied" page | `blocked` | Open immediately for 10 min. Retrying sooner makes blocks last longer |
+| 429, or any `Retry-After` header | `throttled` | Open immediately for `Retry-After`, or 5 min if there isn't one |
+| 200 JSON that fails the Pydantic model | `schema` | Open for 30 min, because retrying won't fix a format change. Save the raw body |
+| 200 JSON outside the plausibility bounds (6.1) | `implausible` | Reject the response, save the raw body, and open as for `schema` |
+| Feed confirmed frozen (below) | `frozen` | Open for 5 min |
+
+Breaker transitions are written to `source_health` immediately; the hourly counters are written at each heartbeat.
+
+**ESPN router (`router.py`).**
+- Each ESPN request goes to the first provider, in the order of section 6.1, whose breaker isn't open.
+- If that request fails, the router tries the next provider once in the same run.
+- It stays with a working fallback, and returns to the primary once the primary's breaker half-opens and its trial succeeds.
+- The web process uses the same router for the game and roster pickers, with its own in-memory breakers.
+- The Odds API and nflverse are single providers: same breaker rules, no fallback. Section 8.2 and section 7.1 cover what happens when they're unavailable.
+
+**Integrity guards (`guards.py`).** Never show or store data older than what is already held.
+- **Progress key per event:** (status rank, period, seconds elapsed in the period).
+  - Status rank is 0 for `scheduled`; 1 for `in_progress`, `break` and `delayed`; 2 for `final`.
+  - Overtime is period ≥ 5. Seconds elapsed = period length − `clock_seconds`.
+- **Comparing a new response with the stored key:**
+  - **Lower:** a stale cached response. Discard it and count it.
+  - **Equal, with different values:** a correction. Accept it and log it.
+  - **Higher:** accept it and set `last_progress_at`.
+  - Score decreases are accepted (an overturned touchdown) and logged. `final` never goes back to in play.
+- **Frozen feed:** the event is `in_progress` (not `break` or `delayed`) and `last_progress_at` is more than 5 minutes old.
+  - Make one probe request to the next ESPN provider.
+  - If the probe shows a higher key, open the current provider's breaker as `frozen` and use the probe's data.
+  - If not, the game itself is probably stopped (a review, an injury). Change nothing, and let the Live card show "no change for N min" (9.4).
+  - Probe at most once every 5 minutes per event.
+- **Plausibility bounds:** section 6.1.
+
+**Raw samples and recording.**
+- Every `schema` or `implausible` failure saves the raw body, truncated to 1 MB, to `raw_samples` with reason `failure`. `prune_samples` keeps the last 5 per provider.
+- For events listed in `RECORD_EVENT_IDS`, every response is saved with reason `recording`. That yields a full real game for the replay test (section 11).
+- `python -m parlaytracker.cli export-sample <id> <path>` writes a sample out as a test fixture.
+
+**Per-event errors.** A parse error for one event goes in `events.last_error` and does not stop other events updating.
+
+**Visibility.** Log to stdout, where Fly collects it. But failures must be visible in the **UI** (sections 9.2 and 9.4), not only in the logs.
 
 ---
 
@@ -733,7 +935,10 @@ Closing lines cannot be backfilled, because historical odds are not affordable, 
 ### 9.2 Navigation
 
 - Use `st.navigation` pages, so only the active page runs. The pages are: Log (the default), Screenshot, Live, Analytics, Review (with the pending count in its title) and Settings.
-- Every page shows a banner if the worker heartbeat is more than 3 minutes old, or if any source has been failing for more than 5 minutes.
+- Every page shows a banner when any of these is true:
+  - the worker heartbeat is more than 3 minutes old;
+  - a provider's breaker has been open for more than 5 minutes. Name the provider and the failure kind (8.3). This includes failures found by the daily canary;
+  - a provider's breaker is open with `schema`. Say "ESPN changed its format; the parser needs updating".
 
 ### 9.3 Log (Quick Add)
 
@@ -754,10 +959,14 @@ After saving, keep the sport, game and sportsbook, and clear the leg rows.
 ### 9.4 Live
 
 - Wrap only the live section in `@st.fragment(run_every=15)`.
-- Show one card per pending slip that has at least one active event:
-  - each leg shows its line, its live value, whether it is over or under right now, and the game clock or status;
+- Show one card per pending slip that has at least one active NFL event:
+  - each NFL leg shows its line, its live value, whether it is over or under right now, and the game clock or status;
+  - each non-NFL leg shows "Not tracked live: settles after the game";
   - parlay cards show progress, for example "2 of 4 over, 1 lost".
-- Every card shows "updated N s ago", taken from `live_updated_at` and `events.last_polled_at`. While the game is in progress, it turns amber after 2 minutes and red after 5.
+- Every NFL card shows "updated N s ago · via {provider}", taken from `live_updated_at`, `events.last_polled_at` and `live_source`. While the game is in progress, it turns amber after 2 minutes and red after 5.
+- If a game is `in_progress` and `last_progress_at` is more than 5 minutes old, the card also shows "No change for N min" in amber (8.3).
+- When every ESPN provider's breaker is open, the page shows "Live data unavailable since HH:MM (ESPN is blocking or erroring). Results will still settle after the game."
+- Below the live cards, "Settled in the last 7 days" lists each slip's result. NFL legs are marked "verified", "awaiting verification" or "unverified" (7.1).
 
 ### 9.5 Review
 
@@ -768,7 +977,7 @@ A queue of everything with `needs_review`, plus legs still missing a closing lin
 - mark the slip cashed out;
 - void.
 
-Every action goes through `services`.
+When two sources disagree, show both values side by side. Every action goes through `services`.
 
 ### 9.6 Screenshot
 
@@ -844,7 +1053,9 @@ Tags are for context only. Suggested categories: situation, injury, weather, mat
   - CLV and the Wilson interval;
   - the ESPN and Odds API parsers against every fixture;
   - alias resolution;
-  - extraction parsing against recorded Qwen responses: valid, partial, malformed, and JSON wrapped in code fences.
+  - extraction parsing against recorded Qwen responses: valid, partial, malformed, and JSON wrapped in code fences;
+  - the integrity guards: every progress-key case in 8.3, the plausibility bounds, and the frozen-feed rule, including a stopped clock during a review, which must **not** switch provider;
+  - the nflverse loaders and ID mapping against fixture slices, and every branch of the NFL rules in 7.1: agree, disagree, missing, snaps > 0, zero snaps, and ESPN unavailable.
 - **Database tests** (real Postgres, as a CI service container or locally):
   - migrations upgrade and downgrade;
   - the constraint and validation cases below;
@@ -864,12 +1075,28 @@ Tags are for context only. Suggested categories: situation, injury, weather, mat
   | An unknown market value | A non-`other` leg with no line |
   | A placed slip with no stake | A placed slip with no stake |
   | A duplicate tag (category, name) | A single with 2 legs, or leg odds ≠ slip odds |
-  | | A parlay with 1 leg, or a leg with no odds |
-  | | An SGP whose legs span two games |
-  | | The same selection twice on one slip |
-  | | An unknown market value |
+  | A settled leg with no `settlement_source`, or a pending leg with one | A parlay with 1 leg, or a leg with no odds |
+  | `verified_at` without `verified_source`, or the reverse | An SGP whose legs span two games |
+  | An unknown event status, data source or failure kind | The same selection twice on one slip |
+  | A raw sample whose reason isn't `failure` or `recording` | An unknown market value |
 
-- **Worker tests:** run each job with mocked HTTP, then inject failures (timeout, HTTP 500, malformed JSON, missing fields). Check that the job returns, backoff advances, `source_health` records the error and other events still update.
+- **Worker tests:** run each job with mocked HTTP. Every job must return normally whatever the HTTP layer does.
+- **Fault matrix.** For each ESPN provider, inject:
+  - every row of the failure table in 8.3: a timeout, a 500, the recorded Akamai 403 HTML page, a 429 with and without `Retry-After`, truncated JSON, a changed format, and an implausible value;
+  - a stale response with a lower progress key;
+  - a frozen feed.
+
+  For each one, check:
+  - the failure kind and the breaker's open duration;
+  - that the router moves to the next provider in the same run;
+  - that `source_health` records it;
+  - that other events still update.
+- **Replay test.** Replay a real NFL game recorded with `RECORD_EVENT_IDS` through `poll_nfl_live`, on a fake clock. Check that:
+  - live values never go backwards in progress;
+  - halftime and stopped-clock periods don't cause a provider switch;
+  - a 403 injected mid-game fails over, and the primary is used again once its breaker recovers;
+  - the final settles correctly after the 10-minute gate.
+- **Request budget.** Drive `poll_nfl_live` through a simulated 14-game Sunday and assert that ESPN requests stay within the limits in 6.1.
 - **App tests:** use `streamlit.testing.v1.AppTest` for:
   - Log: a single, a parlay, an SGP and validation errors;
   - Screenshot: success and failure paths, with mocked extraction;
@@ -943,20 +1170,25 @@ The order is set by what can't be recovered later. Closing lines can never be ba
 - **Exit:** every row of the settlement tables and every constraint and validation case passes against Postgres.
 
 ### Phase 2: Logging, then deploy and start using it
-- ESPN client (scoreboard and roster only) with fixtures.
+- ESPN client (scoreboard and roster only) with fixtures, following the request rules in 6.1 from the start.
 - Auth, and the Log, Review (manual settlement and manual closing line) and Settings pages.
 - Deploy with web and an empty worker.
 - **Exit:** both users can log singles, parlays and SGPs from their phones; manual settlement works; data survives a redeploy.
 
 ### Phase 3: Closing lines
-- Worker skeleton: heartbeat, backoff, `source_health` and the advisory lock.
+- Worker skeleton: heartbeat, `source_health`, the advisory lock, and the HTTP layer with the circuit breaker (8.3).
 - Odds API client, `capture_closing` and the health banner.
 - **Exit:** fixture tests pass; on one real game day, every eligible leg got either a closing line or a manual-entry flag; credit use matches the estimate.
 
 ### Phase 4: Auto-settlement
-- ESPN summary parser, the `settle` and `recheck_settled` jobs, and the Review reasons.
+- ESPN summary parser, and the ESPN router with host failover, integrity guards and raw samples (8.3).
+- The `check_finals`, `settle`, `recheck_settled`, `canary` and `prune_samples` jobs, and the Review reasons.
+- nflverse loaders and `verify_nfl` (6.4, 7.1).
 - A one-off backfill that settles everything logged since Phase 2.
-- **Exit:** one real weekend auto-settled, with every result matching what the sportsbook paid.
+- **Exit:**
+  - the fault-matrix tests pass;
+  - one real weekend auto-settled, with every result matching what the sportsbook paid;
+  - every NFL leg from that weekend is either verified against nflverse or has a Review item explaining why not.
 
 ### Phase 5: Analytics
 - Section 10 in full, built on seeded data first.
@@ -967,15 +1199,19 @@ The order is set by what can't be recovered later. Closing lines can never be ba
 - **Exit:** 10 real slips (singles, parlays and SGPs, from at least 2 sportsbooks) are processed, with their Qwen responses saved as fixtures. Most fields pre-fill correctly, and every failure path lands on the manual form.
 
 ### Phase 7: Live tracking
-- `poll_scoreboards` live values, `poll_player_stats` and the Live page.
-- **Exit:** one live game tracked end to end. Blocking ESPN mid-game turns the cards red within 5 minutes, and tracking recovers without a restart.
+- `poll_nfl_live` with the adaptive cadence (8.1), frozen-feed detection (8.3) and the Live page (9.4).
+- Record one real game with `RECORD_EVENT_IDS`, and add the replay and request-budget tests (section 11).
+- **Exit:** one live NFL game tracked end to end, and:
+  - blocking `site.web.api.espn.com` mid-game switches to `site.api.espn.com` within one run;
+  - blocking every ESPN host turns the cards red within 5 minutes and shows the "Live data unavailable" message;
+  - tracking recovers without a restart once the hosts are unblocked.
 
 ---
 
 ## 14. Non-negotiable constraints
 
 1. A slip reaches the database only through `services.create_slip()` and `SlipIn`. AI output is never written directly.
-2. Nothing settles from a live value; settlement requires a final event.
+2. Nothing settles from a live value; settlement requires an event that has been final for at least 10 minutes.
 3. Nothing is voided or set to zero automatically. Anything ambiguous goes to Review.
 4. Every outbound request has a timeout. No job can crash the worker. Every failure is visible in the UI.
 5. Timestamps are stored in UTC.
@@ -983,6 +1219,7 @@ The order is set by what can't be recovered later. Closing lines can never be ba
 7. Qwen models only; no Anthropic models.
 8. Streamlit only: no separate API server, no JavaScript frontend, and data is ingested by polling.
 9. Exactly one worker instance.
+10. ESPN requests follow section 6.1: an honest User-Agent, single dates and the rate limits. A blocked or throttled provider is backed off, never hammered.
 
 ---
 
@@ -993,7 +1230,14 @@ This spec could not confirm the following. Check each one and update the spec:
 - **ESPN:**
   - which date the scoreboard's `dates` parameter uses for late games;
   - the box-score column keys for each sport, especially NHL points;
-  - the shape of the roster endpoint.
+  - the shape of the roster endpoint;
+  - how ESPN reports halftime, end of period and weather delays, for the `break` and `delayed` mapping;
+  - whether `cdn.espn.com/core/nfl/game?xhr=1&gameId=` wraps the summary in `gamepackageJSON`. If not, drop the `espn_cdn` provider;
+  - whether ESPN blocks requests from Fly's `ams` region. The canary shows this on the first deploy; if it's blocked, move the worker to a US region.
+- **nflverse:**
+  - the `espn` column in `load_schedules()` and the `espn_id` column in `load_players()`;
+  - when weekly player stats and snap counts are published;
+  - how snap counts link to the players table (PFR ID).
 - **The Odds API:**
   - the market keys in 6.2, especially `alternate_team_totals` and the `*_alternate` player keys;
   - the credit cost of the events endpoint;
@@ -1009,6 +1253,7 @@ This spec could not confirm the following. Check each one and update the spec:
 | Item | Cost |
 |---|---|
 | ESPN | Free |
+| nflverse | Free |
 | The Odds API | Free (500 credits a month) |
 | Qwen | Fractions of a cent per screenshot |
 | Fly.io | Two small machines, with the worker always on and web sleeping: a few dollars a month |
