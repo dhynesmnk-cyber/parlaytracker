@@ -1,0 +1,9 @@
+[Unit]
+Description=ParlayTracker: nightly database backup
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/default/parlaytracker
+ExecStart=/opt/parlaytracker/deploy/backup.sh

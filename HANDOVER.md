@@ -7,55 +7,51 @@ For the next agent picking up ParlayTracker. Read [SPEC.md](SPEC.md) first: it i
 | | |
 |---|---|
 | Branch | `claude/vigilant-sagan-acmryz`, open as [dhynesmnk-cyber/parlaytracker#4](https://github.com/dhynesmnk-cyber/parlaytracker/pull/4). New commits on the branch update the PR |
-| Done | Phase 0 (reset and tooling) and Phase 1 (core domain) of SPEC.md section 13 |
-| Next | Phase 2: logging UI, then deploy (below) |
-| Tests | 940 passing locally on Python 3.12 + PostgreSQL 16: 904 unit, 36 database |
-| CI | `.github/workflows/ci.yml`: ruff and pytest against a Postgres 16 service, on every push and PR. See the CI section at the end |
-| Hosting | **Decided:** a dedicated laptop at home with Docker Compose, reachable only over Tailscale (SPEC.md section 12). Fly.io, hosted Postgres and Google OAuth are all dropped; `fly.toml` is deleted |
-| AI | **Decided:** Qwen through OpenRouter (section 6.3); DashScope is no longer used |
+| Done | Phases 0 and 1, and the **code** for Phase 2 (SPEC.md section 13) |
+| Phase 2 still open | Its exit criteria need the real laptop: install it, log real slips from both phones over Tailscale, reboot, update, and restore a backup once (below) |
+| Next after that | Phase 3: closing lines |
+| Tests | 1,029 passing locally on Python 3.12 + PostgreSQL 16 (unit, database and Streamlit app tests) |
+| CI | Two jobs on every push: `test` (ruff + pytest against Postgres 16) and `deploy` (build the image, run the Compose stack as on the laptop, check web + worker, restore a backup). See the CI section at the end |
+| Hosting | A dedicated laptop at home with Docker Compose, reachable only over Tailscale (section 12) |
+| AI | Qwen through OpenRouter (section 6.3); not needed until Phase 6 |
 | Network | Full access is enabled for this cloud environment, and `ODDS_API_KEY` is set as an environment variable |
 
-### Verified on 2026-09-28
-
-SPEC.md section 15 lists what was checked against the real APIs, and what still needs a live game. The main surprises:
-- **ESPN:** `site.api.espn.com` answers this cloud environment with Akamai's 403, while `site.web.api.espn.com` and `cdn.espn.com` work. Record fixtures from `site.web.api.espn.com`.
-- **The Odds API:**
-  - Caesars (`williamhill_us`) wasn't among the bookmakers returned for an NFL game.
-  - The account had used 49 credits this month before the build began. After the 14-credit verification call, 437 were left on 2026-09-28. Use the saved fixtures in `tests/fixtures/odds_api/` rather than spending more.
-- **nflverse:** it agreed with ESPN on 290 of 290 stat lines. Release downloads go through `release-assets.githubusercontent.com`, which works here.
-
-### What exists
+## What exists
 
 | Path | What it is |
 |---|---|
-| `parlaytracker/core/models.py` | SQLAlchemy models. Identical to the SPEC.md section 4 code block |
-| `parlaytracker/core/schemas.py` | `SlipIn`/`LegIn` (strict gate) and `ExtractedSlip` (loose). Identical to the section 5 block |
-| `parlaytracker/core/config.py` | `Settings` (pydantic-settings) and `normalize_database_url()`. The only place env vars are read |
-| `parlaytracker/core/db.py` | `make_engine()`, `session_factory()`, `session_scope()` (commits on success, rolls back on error) |
-| `parlaytracker/core/odds.py` | `decimal_odds`, `american_odds`, `parlay_decimal`, `payout`, `implied_probability`, `no_vig`, `wilson_interval` |
-| `parlaytracker/core/settlement.py` | Pure `score_value`, `settle_leg`, `settle_slip` (sections 7.1 and 7.2). No database access |
-| `parlaytracker/core/markets.py` | `MARKET_SPORTS` / `markets_for(sport)`: which markets each sport offers (section 1.2) |
-| `parlaytracker/core/services.py` | `create_slip` (the only slip write path), `find_duplicates`, `slip_warnings` |
-| `migrations/versions/0001_initial_schema.py` | Whole schema, plus seeded sportsbooks (DraftKings, FanDuel, BetMGM, Caesars) |
-| `scripts/dev_postgres.py` | Starts a local Postgres without Docker (via `pgserver`), prints its URL |
-| `tests/unit/`, `tests/db/` | See "Tests" below |
-| `tests/fixtures/odds_api/` | A real NFL events list and one event's odds for all 14 NFL market keys (cost 14 credits; reuse them, don't re-fetch) |
+| `parlaytracker/core/` | Models (0001, 0002), schemas, config, odds maths, settlement, services. `models.py` and `schemas.py` are canonical and identical to the SPEC.md code blocks |
+| `parlaytracker/core/services.py` | The only write path. Phase 1: `create_slip`, `find_duplicates`, `slip_warnings`. Phase 2: `upsert_event`, `settle_leg_manually`, `reopen_leg`, `refresh_slip`, `enter_slip_payout`, `mark_cashed_out`, `set_closing_line`, `review_queue`/`review_count`, tag and sportsbook management, and read helpers (`sportsbooks`, `all_tags`, `open_slips`, `recent_slips`, `event_ids_for`) |
+| `parlaytracker/ingest/http.py` | Shared httpx client (`ParlayTracker/1.0`, no cookies), `RateLimiter`, and `FetchError` with a `FailureKind` for every failure |
+| `parlaytracker/ingest/espn.py` | Scoreboard and roster parsers (Pydantic-validated, per-event errors), status mapping, US Eastern game days, and host failover (`site.web.api` → `site.api`). No breakers yet: those are Phase 3–4 |
+| `parlaytracker/app/` | Streamlit app: `main.py` (navigation, auth, health banner), `auth.py` (Tailscale guard), `common.py`, `components/slip_form.py`, `pages/log.py`, `review.py`, `settings.py` |
+| `parlaytracker/worker/__main__.py` | Phase 2 worker: advisory lock + heartbeat every 60 s. Phase 3 adds APScheduler and the jobs |
+| `Dockerfile`, `.dockerignore`, `.streamlit/config.toml` | One image for web, worker and migrations; the config hides Streamlit's developer menu |
+| `deploy/` | `docker-compose.yml`, `setup.sh`, `update.sh`, `backup.sh`, `restore.sh`, `status.sh`, `compose.sh`, `lib.sh`, `env.example`, systemd units, and `README.md` (the user's step-by-step guide) |
+| `tests/fixtures/espn/` | Real ESPN responses: NFL final, overtime and scheduled scoreboards; an MLB day with 2 postponements; NBA and NHL scoreboards; rosters for all four sports (NBA's is a flat list, the others are grouped); an Akamai 403 page |
+| `tests/fixtures/odds_api/` | A real NFL events list and one event's odds for all 14 NFL market keys. They cost 14 credits: reuse them, don't re-fetch |
 
-### Decisions made while building (not spelled out in SPEC.md)
+## Decisions made while building (not spelled out in SPEC.md)
 
-1. **Services flush, never commit.** Callers wrap them in `db.session_scope()`. Keep this for every new service.
-2. **`create_slip` rejects a market the event's sport doesn't offer** (e.g. `player_receptions` on an NBA game), using `MARKET_SPORTS`. The UI should use `markets_for(sport)` to fill the market dropdown.
-3. **`settle_slip` signals "needs review" by returning status `PENDING` with a `review_reason`.** The caller sets `slip.needs_review` and `slip.review_reason`. Cash-outs aren't handled there; they're a user action (Phase 2 service).
-4. **Money rounding:** payouts are rounded half-up to the cent. Unplaced slips settle in units, also to 2 decimal places (a −110 winner returns 1.91).
-5. **`american_odds()`** returns +100 for even money, so −100 comes back as +100.
-6. **Leg invariant in the database:** a leg's `result` is `pending` exactly when `settlement_source` is NULL. Manual settlement in Phase 2 must therefore set `settlement_source = 'manual'`.
-7. **Ruff rules are E, F, W, B, UP, without import sorting.** That keeps `models.py` and `schemas.py` byte-identical to the SPEC.md blocks. If you change either file, update SPEC.md in the same commit, or state in SPEC.md that the code is now canonical.
-8. **Dependencies are only what Phases 0–1 need.** Each phase adds its own (section 2.1): `streamlit` (no `[auth]` extra now), `httpx`, `apscheduler<4`, `rapidfuzz`, `pandas`, `plotly`, `Pillow`, `openai`, `nflreadpy`, and `respx` for dev.
-9. **`Settings`** already has the Tailscale and OpenRouter fields: `allowed_logins` (split on commas, lowercased), `dev_login`, `qwen_api_key`, `qwen_base_url`, `qwen_vision_model`.
+1. **Services flush, never commit.** Callers wrap them in `db.session_scope()`.
+2. **In Streamlit, writes happen in widget callbacks.** Each callback runs one service call in its own `session_scope()` and reports through `common.flash()`. Never call `st.rerun()` inside a `session_scope()`: the exception it raises rolls the transaction back.
+3. **The slip form never writes to a widget's own session-state key once it exists.** Defaults live under `leg{uid}_{field}_default`. Saving and resetting happen in the Save callback, before the next run creates the widgets.
+4. **`upsert_event` only refreshes an event while it's still `scheduled`**, so the picker's 10-minute cache can never overwrite what the worker has written.
+5. **`review_queue`:**
+   - "Result needed" means a pending leg 4 hours after kickoff. Phase 4 automates most of these.
+   - Missing closing lines are offered for the last 7 days only, and aren't counted in the nav badge.
+6. **Leg invariant:** `result` is `pending` exactly when `settlement_source` is NULL. Manual settlement sets `manual`; `reopen_leg` clears it.
+7. **Secrets:** `odds_api_key` and `qwen_api_key` are `SecretStr` (use `.get_secret_value()`), and `Settings` hides input values in its errors. That was added after a config error printed most of the Odds API key during testing (see "Needs the user").
+8. **Rate limits:** the web app waits up to 5 s for a slot (`common.WEB_MAX_WAIT`); the worker must pass `max_wait=0` and skip the request.
+9. **Ruff rules are E, F, W, B, UP**, without import sorting, to keep `models.py`/`schemas.py` identical to the spec blocks.
+10. **Dependencies:** each phase adds its own. Phase 3 needs `apscheduler<4`; later phases need `rapidfuzz`, `pandas`, `plotly`, `Pillow`, `openai` and `nflreadpy`.
 
-### Alembic gotcha (already fixed once)
+## Gotchas
 
-Autogenerate wrote the LIKE pattern in `ck_legs_athlete_iff_player_market` as `'player_%%'`, so the database stored `%%`. It's fixed by hand in `0001`. `tests/db/test_migrations.py::test_migrated_schema_matches_models` compares the migrated schema with `create_all()` column by column, constraint by constraint and index by index. **Run it after generating any new migration**, and read every autogenerated file before committing it.
+- **Alembic autogenerate escapes `%`** in CHECK constraints (it wrote `'player_%%'` in 0001; fixed by hand). `tests/db/test_migrations.py` compares the migrated schema with the models column by column, constraint by constraint and index by index. Run it after every new migration.
+- **Streamlit's test harness** (`AppTest`) sends no headers, so app tests sign in through `DEV_LOGIN`. `AppTest.from_function` needs a function defined in a real file.
+- **Phone-width navigation:** at phone width Streamlit folds the top navigation into a menu. Browser tests should open pages by URL (`/review`, `/settings`).
+- **Moving test fixtures:** `engine` and `make_alembic_config` live in `tests/conftest.py` (shared by `tests/db` and `tests/app`). App tests commit for real, so their fixture truncates the tables afterwards.
 
 ## Running it
 
@@ -63,86 +59,64 @@ Autogenerate wrote the LIKE pattern in `ck_legs_athlete_iff_player_market` as `'
 python3.12 -m venv .venv            # or: uv venv --python 3.12 .venv
 .venv/bin/pip install -e ".[dev,localdb]"
 export TEST_DATABASE_URL="$(.venv/bin/python scripts/dev_postgres.py)"
-.venv/bin/ruff check .
+.venv/bin/ruff check . && .venv/bin/shellcheck -x -P deploy deploy/*.sh
 .venv/bin/pytest
 ```
 
-- The local Postgres lives in `.pgdata/` and is lost when the cloud container is reclaimed. Re-run the script in a new session. `--stop` stops it.
-- **Install gotcha:** install the package (`pip install -e .`) only after `parlaytracker/` exists. If you get `No module named 'parlaytracker'`, reinstall.
-- **In this cloud environment:** `uv` needs `SSL_CERT_FILE=/root/.ccr/ca-bundle.crt` to reach PyPI through the proxy.
-- **Test database safety:** the suite drops and recreates schema `public` in `TEST_DATABASE_URL`. It refuses any database whose name doesn't contain `test`. Without `TEST_DATABASE_URL`, database tests are skipped; with `CI` set, a missing URL is an error.
-- **Migrations by hand:** `DATABASE_URL=... DISPLAY_TZ=UTC .venv/bin/alembic upgrade head`. `alembic check` confirms the models and migrations agree.
+- The local Postgres lives in `.pgdata/` and is lost when the cloud container is reclaimed; re-run the script in a new session. The test suite wipes `parlaytracker_test`. For clicking around, create a separate `parlaytracker_dev` database on the same server.
+- **Running the app locally:**
 
-## Tests
+  ```bash
+  DATABASE_URL=<dev url> DISPLAY_TZ=Europe/London ALLOWED_LOGINS=you@example.com DEV_LOGIN=you@example.com \
+    .venv/bin/streamlit run parlaytracker/app/main.py
+  ```
 
-- **`tests/unit/test_settlement.py`:** every row of SPEC.md tables 7.1 and 7.2, including the $77 / $35 worked example.
-- **`tests/unit/test_schemas.py`:** every "Rejected by `SlipIn` / `LegIn`" case in section 11, plus a few more.
-- **`tests/unit/test_odds.py`:** the cases ported from the old `test_math_calculator.py`, the section 7.3 values, and an American ↔ decimal round trip from −500 to +500.
-- **`tests/db/test_constraints.py`:** every "Rejected by the database" case in section 11. It inserts through the ORM or raw SQL, bypassing Pydantic, and also checks cascades.
-- **`tests/db/test_services.py`:** `create_slip` for single, parlay (with tags and an `other` leg) and SGP; bad references; the sport/market check; duplicate detection.
-- **`tests/db/test_migrations.py`:** the migrated schema equals the models; nothing is pending for autogenerate; downgrade and upgrade again, with the seed data restored.
+  Add `SSL_CERT_FILE=/root/.ccr/ca-bundle.crt` in this cloud environment so httpx trusts the proxy.
+- **Testing the Tailscale path without Tailscale:** run a reverse proxy in front of Streamlit that adds `Tailscale-User-Login`, including on the websocket upgrade. The one used for Phase 2 is described in SPEC.md 9.1; it's 50 lines of aiohttp.
+- **Docker** isn't available in this cloud environment. The CI `deploy` job is the check for the image and the Compose stack.
+- **`uv`** needs `SSL_CERT_FILE=/root/.ccr/ca-bundle.crt` to reach PyPI through the proxy here.
 
-## Next: Phase 2 (logging, then deploy)
+## Checked by hand in Phase 2
 
-The goal is for both users to log singles, parlays and SGPs from their phones and settle them by hand (exit criteria in SPEC.md section 13). Suggested order:
+- **In a real browser (Chromium, phone-sized window), through a header-adding proxy:**
+  - no header → refused; an unlisted login → refused; an allowed login → signed in;
+  - a real single logged for Monday Night Football (PHI @ CHI) from live ESPN data, with the player picked from the live roster;
+  - the duplicate warning shown, a tag added, and the Review page loading.
+- **The image's contents,** installed into a clean environment exactly as the `Dockerfile` copies them: migrations to head, web health OK, and the worker writing its heartbeat and stopping cleanly on SIGTERM. A second worker exits with "another worker already holds the lock".
+- **`docker compose config`:** only `web` is published, on `127.0.0.1:8501`; the database isn't exposed; migrations gate web and worker; a missing `POSTGRES_PASSWORD` is refused.
 
-1. **Record fixtures first.** The network is open now. Record real ESPN scoreboard, summary and roster responses for all four sports into `tests/fixtures/espn/` **before** writing parsers (section 6.1), from `site.web.api.espn.com`, one request every 2 seconds. Useful IDs:
-   - NFL week 3 finals on `dates=20260927` (e.g. `401872958`, ARI@SF);
-   - overtime finals on `20260913` (`401872923`) and `20260920` (`401872936`, `401872945`);
-   - a postponed MLB game `401815223` (May 2026);
-   - NBA `401810723` and NHL `401803298` (both 2026-03-01).
+## Next steps
 
-   Halftime and delay statuses need a live game.
-2. **`ingest/http.py`:**
-   - one shared httpx client with timeouts;
-   - the `ParlayTracker/1.0` User-Agent;
-   - single-date queries only;
-   - the per-host and global rate limits from section 6.1.
+**Phase 2, on the laptop (needs the user):**
+1. The user follows `deploy/README.md`:
+   - install Ubuntu Server;
+   - set up Tailscale (MagicDNS and HTTPS certificates on);
+   - run `setup.sh` with `BRANCH=claude/vigilant-sagan-acmryz` until PR #4 is merged.
 
-   The full router and circuit breaker are Phase 3–4 work. Building the provider list in order (`site.web.api.espn.com` first) now makes that easy.
-3. **`ingest/espn.py`:** scoreboard and roster parsers. Validate with Pydantic and return typed dataclasses. Map statuses to `EventStatus`, including `break` and `delayed`.
-4. **New services:**
-   - get-or-create an `Event` from a scoreboard game when a user picks it;
-   - set a leg result/value manually (`settlement_source = 'manual'`, then re-run `settle_slip` and store the outcome);
-   - enter a slip payout, mark cashed out, and enter a closing line manually (`closing_source = 'manual'`);
-   - manage tags (rename, merge, retire) and sportsbooks.
-5. **App:**
-   - `app/auth.py`: the Tailscale guard in section 9.1, reading `Tailscale-User-Login` from `st.context.headers` and checking it against `allowed_logins`, with the `dev_login` fallback;
-   - `app/main.py`: `st.navigation`;
-   - `components/slip_form.py`: the one shared form, with warnings from `slip_warnings(find_duplicates(...))`;
-   - pages Log, Review and Settings.
+   Or they start `claude remote-control` on the laptop, and a session there does it.
+2. Then check the exit criteria in SPEC.md section 13:
+   - both phones log and settle slips;
+   - the data survives a reboot and an automatic update;
+   - a backup restores once.
 
-   Test them with `streamlit.testing.v1.AppTest`.
-6. **Deploy to the laptop (section 12):**
-   - Rewrite the `Dockerfile`: it still runs the deleted `frontend.py`, so it is broken.
-   - Write `deploy/`: `docker-compose.yml` (`db`, `migrate`, `web` on `127.0.0.1:8501`, `worker`), `setup.sh`, `update.sh`, `backup.sh`, `status.sh`, the systemd units and a README with the restore procedure.
-   - Add a worker that only writes its heartbeat (Phase 3 fills it in).
-   - The laptop is the user's. This cloud session can't reach it: either the user runs `deploy/setup.sh`, or they start `claude remote-control` in the repo folder on the laptop so a session there can.
+   Also confirm the Tailscale header on real Serve, and whether `site.api.espn.com` answers the home connection (section 15).
+
+**Phase 3 (can start now, in parallel):** closing lines (section 8.2):
+- APScheduler worker skeleton with the circuit breaker (8.3) and `source_health` writes;
+- Odds API client (use the saved fixtures);
+- `capture_closing` with the credit budget and reserve.
 
 ## Needs the user
 
-Done:
-- ~~Network access~~: full access enabled.
-- ~~Odds API key~~: set as `ODDS_API_KEY` in the environment.
-- ~~Hosting choice~~: laptop + Tailscale.
-
-Still to do:
-1. **Prepare the laptop** (before Phase 2 can finish):
-   - install Ubuntu Server 24.04 LTS;
-   - set it never to sleep and to ignore the lid;
-   - create a Tailscale account, install Tailscale on the laptop and both phones, and invite the second user.
-
-   Then run `deploy/setup.sh` once it exists, or start `claude remote-control` on the laptop.
-2. **Both users' Tailscale login names** for `ALLOWED_LOGINS`. They can be entered during setup; they don't need to go in chat.
-3. **A backup destination** for `rclone`, such as a cloud drive folder.
-4. **For Phase 6 only:** an OpenRouter account with a few dollars of credit, and training-permitted providers turned off in its privacy settings. Add its key as the environment variable `QWEN_API_KEY` here, and in the laptop's `.env`.
+1. **Rotate the Odds API key.** A config error during testing printed about 29 of its 32 characters into this session's tool output. It was never committed or sent anywhere else, and the leak is fixed (decision 7), but a new key from the-odds-api.com is the safe move. Then update the `ODDS_API_KEY` environment variable here, and the laptop's `.env` once it exists.
+2. **Prepare the laptop:** `deploy/README.md` steps 1–3.
+3. **Both users' Tailscale login names** for `ALLOWED_LOGINS`. They're entered during setup and don't need to go in chat.
+4. **A backup destination** for `rclone` (README step 4), then one test restore (step 5).
+5. **For Phase 6 only:** an OpenRouter key as `QWEN_API_KEY`, with training-permitted providers turned off.
 
 Never paste keys into chat.
 
 ## CI
 
-- **Run 1** on `1d789d7` [passed](https://github.com/dhynesmnk-cyber/parlaytracker/actions/runs/36452614623): ruff clean, pytest green. The Postgres service log shows every expected constraint rejection, so the database tests really ran; they weren't skipped.
-- **Run 2** on `efc7880` [passed](https://github.com/dhynesmnk-cyber/parlaytracker/actions/runs/36452792029). That commit changed the workflow in two ways:
-  - the health check now names the database (`-d parlaytracker_test`), so it stops logging `FATAL: database "parlaytracker" does not exist`;
-  - it moved to `actions/checkout@v5` and `actions/setup-python@v6`, because GitHub warned that the v4/v5 actions target the deprecated Node 20.
-- Later commits only touch this file. Check the latest run is green before building on it.
+- **Runs 1–2** (`1d789d7`, `efc7880`) passed. From run 2 the workflow names the database in the Postgres health check and uses `actions/checkout@v5` / `actions/setup-python@v6`.
+- **Phase 2** adds the `deploy` job. Check that the latest run on the PR is green before building on it.

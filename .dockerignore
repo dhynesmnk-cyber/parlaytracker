@@ -1,5 +1,14 @@
-fly.toml
+# Only what the image needs goes in: see the COPY lines in Dockerfile.
 .git/
-__pycache__/
-.envrc
+.github/
 .venv/
+.pgdata/
+**/__pycache__/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.env
+.env.*
+tests/
+deploy/
+scripts/

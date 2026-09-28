@@ -45,6 +45,20 @@ def test_allowed_logins_are_split_and_lowercased(env):
     assert Settings(_env_file=None).allowed_logins == ["alice@example.com", "bob@github"]
 
 
+def test_api_keys_never_appear_in_errors_or_repr(env):
+    secret = "fcsecretkey0123456789abcdefsecret"
+    env.setenv("ODDS_API_KEY", secret)
+    env.setenv("QWEN_API_KEY", secret)
+    settings = Settings(_env_file=None)
+    assert settings.odds_api_key.get_secret_value() == secret
+    assert secret not in repr(settings) and secret not in str(settings)
+    env.setenv("DISPLAY_TZ", "Mars/Olympus")
+    with pytest.raises(ValidationError) as info:
+        Settings(_env_file=None)
+    assert secret not in str(info.value)
+    assert secret[:7] not in str(info.value)
+
+
 def test_settings_reject_unknown_time_zone(env):
     env.setenv("DISPLAY_TZ", "Mars/Olympus")
     with pytest.raises(ValidationError):

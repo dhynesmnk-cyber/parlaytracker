@@ -5,7 +5,7 @@ from decimal import Decimal
 
 from sqlalchemy import (
     CheckConstraint, Column, DateTime, Enum, ForeignKey, Index, MetaData, Numeric,
-    String, Table, Text, UniqueConstraint, func,
+    String, Table, Text, UniqueConstraint, false, func,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -195,6 +195,8 @@ class Tag(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     category: Mapped[str] = mapped_column(String(50))
     name: Mapped[str] = mapped_column(String(100))
+    # Retired tags stay on old legs but are hidden from pickers (section 9.7).
+    retired: Mapped[bool] = mapped_column(default=False, server_default=false())
 
     legs: Mapped[list["Leg"]] = relationship(secondary=leg_tags, back_populates="tags")
 

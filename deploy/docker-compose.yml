@@ -1,0 +1,64 @@
+# ParlayTracker on the laptop (SPEC.md section 12). Always run it through deploy/lib.sh's
+# `compose` wrapper, which passes --env-file /opt/parlaytracker/.env for the variables below.
+name: parlaytracker
+
+x-app: &app
+  image: parlaytracker-app
+  pull_policy: never  # always built here; never fetch an image of this name from a registry
+  env_file: ../.env
+  environment:
+    # Composed here so the password lives in one place (.env: POSTGRES_PASSWORD).
+    DATABASE_URL: postgresql://parlaytracker:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@db:5432/parlaytracker
+
+services:
+  db:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: parlaytracker
+      POSTGRES_DB: parlaytracker
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U parlaytracker -d parlaytracker"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  migrate:
+    <<: *app
+    build: ..
+    command: ["alembic", "upgrade", "head"]
+    restart: "no"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  web:
+    <<: *app
+    command: ["streamlit", "run", "parlaytracker/app/main.py",
+              "--server.address=0.0.0.0", "--server.port=8501"]
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8501:8501"  # localhost only: Tailscale Serve is the only way in (9.1)
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8501/_stcore/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  worker:
+    <<: *app
+    command: ["python", "-m", "parlaytracker.worker"]
+    restart: unless-stopped
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+volumes:
+  pgdata:

@@ -1,0 +1,9 @@
+# Streamlit settings for ParlayTracker. Secrets never go here (there are none: see SPEC.md 9.1).
+[client]
+toolbarMode = "minimal"   # no developer "Deploy" menu on the phones
+
+[browser]
+gatherUsageStats = false
+
+[server]
+headless = true

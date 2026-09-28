@@ -3,7 +3,7 @@ from functools import lru_cache
 from typing import Annotated
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import field_validator
+from pydantic import SecretStr, field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
@@ -16,15 +16,17 @@ def normalize_database_url(url: str) -> str:
 
 
 class Settings(BaseSettings):
-    # Empty variables (e.g. "ODDS_API_KEY=" in .env) count as unset.
-    model_config = SettingsConfigDict(env_file=".env", env_ignore_empty=True, extra="ignore")
+    # Empty variables (e.g. "ODDS_API_KEY=" in .env) count as unset. Errors never echo the
+    # input: a bad setting must not print the API keys into the logs.
+    model_config = SettingsConfigDict(env_file=".env", env_ignore_empty=True, extra="ignore",
+                                      hide_input_in_errors=True)
 
     database_url: str
     display_tz: str
-    odds_api_key: str | None = None
+    odds_api_key: SecretStr | None = None  # read with .get_secret_value()
     odds_api_reserve: int = 50
     # Qwen through OpenRouter's OpenAI-compatible API (SPEC.md section 6.3).
-    qwen_api_key: str | None = None
+    qwen_api_key: SecretStr | None = None
     qwen_base_url: str = "https://openrouter.ai/api/v1"
     qwen_vision_model: str = "qwen/qwen3-vl-32b-instruct"
     min_sample: int = 30

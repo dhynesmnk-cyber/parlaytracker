@@ -6,6 +6,7 @@ the pooled history, where there is a real edge.
 
 - **[SPEC.md](SPEC.md)** is the design and the build plan. Build its phases in order.
 - **[HANDOVER.md](HANDOVER.md)** says which phases are done and what to do next.
+- **[deploy/README.md](deploy/README.md)** sets the app up on the home laptop, reachable over Tailscale.
 
 ## Development
 

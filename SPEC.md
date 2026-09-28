@@ -123,12 +123,15 @@ parlaytracker/
     jobs.py
   app/
     main.py          # st.navigation, auth guard, health banner
-    auth.py
+    auth.py          # Tailscale identity guard (section 9.1)
+    common.py        # formatting, cached ESPN lookups, health banner, messages
     components/slip_form.py   # the ONE slip form, used by both Log and Screenshot
     pages/log.py  screenshot.py  live.py  analytics.py  review.py  settings.py
   cli.py             # maintenance commands, e.g. export a raw sample as a test fixture
 migrations/          # Alembic
-deploy/              # laptop setup, Docker Compose, auto-update and backup (section 12)
+deploy/              # laptop: docker-compose.yml, setup/update/backup/restore/status scripts,
+                     # systemd timers, README (section 12)
+.streamlit/config.toml  # hides Streamlit's developer menu; no secrets
 tests/
   fixtures/espn/  fixtures/odds_api/  fixtures/qwen/
   unit/  db/  worker/  app/
@@ -156,6 +159,7 @@ Rules:
 | `ALLOWED_LOGINS` | yes, for web | Comma-separated Tailscale login names allowed to use the app, compared case-insensitively (section 9.1). If it is empty, nobody gets in |
 | `DEV_LOGIN` | no | Local development only: the login to assume when no Tailscale header is present. Never set on the laptop |
 
+- `ODDS_API_KEY` and `QWEN_API_KEY` are held as `SecretStr` (read with `.get_secret_value()`), and `Settings` never echoes input values in its errors, so a bad setting can't print a key into the logs.
 - Every timestamp is stored in UTC (`timestamptz`) and converted to `DISPLAY_TZ` only in the UI.
 - A "game day" for ESPN scoreboard requests is the US Eastern calendar date, so a Sunday-night NFL game belongs to Sunday. Verified: `dates=20260927` includes the 8:20pm ET game that starts at 00:20 UTC on the Monday.
 
@@ -174,7 +178,7 @@ Design notes:
 - Every live, settled and verified value records which provider it came from (`live_source`, `settlement_source`, `verified_source`).
 - Tags attach to legs and are for subjective context only. Section 10.2 lists the dimensions that already exist as columns; these must never be tagged.
 
-The code below has been run against PostgreSQL 16 (and SQLite): every valid case is accepted, and every constraint and validation case listed in section 11 is rejected.
+The code below is identical to `parlaytracker/core/models.py`, which is canonical from Phase 1 on; keep the two in step. It is tested against PostgreSQL 16: every valid case is accepted, and every constraint and validation case listed in section 11 is rejected.
 
 ```python
 import enum
@@ -183,7 +187,7 @@ from decimal import Decimal
 
 from sqlalchemy import (
     CheckConstraint, Column, DateTime, Enum, ForeignKey, Index, MetaData, Numeric,
-    String, Table, Text, UniqueConstraint, func,
+    String, Table, Text, UniqueConstraint, false, func,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -373,6 +377,8 @@ class Tag(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     category: Mapped[str] = mapped_column(String(50))
     name: Mapped[str] = mapped_column(String(100))
+    # Retired tags stay on old legs but are hidden from pickers (section 9.7).
+    retired: Mapped[bool] = mapped_column(default=False, server_default=false())
 
     legs: Mapped[list["Leg"]] = relationship(secondary=leg_tags, back_populates="tags")
 
@@ -476,7 +482,9 @@ class RawSample(Base):
 
 Alembic:
 - Set `target_metadata = Base.metadata`. The naming convention gives autogenerate stable constraint names.
-- Migration `0001` creates everything above and seeds `sportsbooks`: DraftKings (`draftkings`), FanDuel (`fanduel`), BetMGM (`betmgm`) and Caesars (`williamhill_us`). Verify the Odds API keys (section 15).
+- Migration `0001` creates the schema and seeds `sportsbooks`: DraftKings (`draftkings`), FanDuel (`fanduel`), BetMGM (`betmgm`) and Caesars (`williamhill_us`).
+- Migration `0002` adds `tags.retired` (section 9.7).
+- After generating a migration, run `tests/db/test_migrations.py`: it compares the migrated schema with the models, column by column and constraint by constraint.
 
 ---
 
@@ -644,7 +652,7 @@ Request rules (enforced in `http.py`, for both web and worker):
 - **User-Agent:** a fixed, honest, non-browser string: `ParlayTracker/1.0`. Never a spoofed browser string.
 - **Headers:** `Accept: application/json` and gzip. Use one shared client with keep-alive, and no cookies.
 - **Dates:** single `dates=YYYYMMDD` only. Never ranges.
-- **Rate limits:** at most 1 request every 2 seconds per host, and at most 20 requests a minute to ESPN overall. A request over the limit is skipped until the next run, never queued.
+- **Rate limits:** at most 1 request every 2 seconds per host, and at most 20 requests a minute to ESPN overall. In the worker, a request over the limit is skipped until the next run, never queued. In the web app, a request may wait up to 5 seconds for a slot, because a person is waiting for the game or roster list.
 
 Rules for parsers:
 - **Record real responses as fixtures in `tests/fixtures/espn/` before writing any parser.** For each sport, record at least one scheduled, one in-progress, one final, one overtime and one postponed game. For the NFL, also record:
@@ -968,11 +976,11 @@ Breaker transitions are written to `source_health` immediately; the hourly count
   - **any other login:** stop with "This Tailscale account isn't allowed".
 - The header is trustworthy only because the app listens on localhost behind Serve. Never expose the port any other way: no Tailscale Funnel, no router port forwarding.
 - There is no password and no OAuth provider. Signing in to Tailscale (with Google, Microsoft, Apple, GitHub and so on) is the login.
-- Verify at build time that the header reaches `st.context.headers` for the app's websocket session (section 15).
+- Tested with a reverse proxy that adds the header the way Serve does: the header reaches `st.context.headers` through Streamlit's websocket, an unlisted login is refused, and a request without the header is refused. Real Tailscale Serve is confirmed on the laptop (section 15).
 
 ### 9.2 Navigation
 
-- Use `st.navigation` pages, so only the active page runs. The pages are: Log (the default), Screenshot, Live, Analytics, Review (with the pending count in its title) and Settings.
+- Use `st.navigation` pages, so only the active page runs. The pages are: Log (the default), Screenshot, Live, Analytics, Review (with the pending count in its title) and Settings. On a phone-width screen, Streamlit folds the top navigation into a menu.
 - Every page shows a banner when any of these is true:
   - the worker heartbeat is more than 3 minutes old;
   - a provider's breaker has been open for more than 5 minutes. Name the provider and the failure kind (8.3). This includes failures found by the daily canary;
@@ -1141,7 +1149,9 @@ Tags are for context only. Suggested categories: situation, injury, weather, mat
   - Screenshot: success and failure paths, with mocked extraction;
   - Review actions;
   - Analytics rendering on seeded data.
-- **CI** (GitHub Actions): ruff and pytest against a Postgres service on every push.
+- **CI** (GitHub Actions), on every push:
+  - `test`: ruff and pytest against a Postgres service;
+  - `deploy`: shellcheck the deploy scripts, build the image, start the Compose stack as on the laptop, check the web app and the worker heartbeat, and restore a backup.
 
 ---
 
@@ -1159,7 +1169,7 @@ The app runs on one dedicated laptop at home. Nothing is exposed to the internet
 | Service | Runs | Notes |
 |---|---|---|
 | `db` | `postgres:16` | Data in a named volume; not published outside the Compose network |
-| `migrate` | `alembic upgrade head` | One-shot; must succeed before `web` and `worker` start |
+| `migrate` | `alembic upgrade head` | One-shot; must succeed before `web` and `worker` start. The app image is built on the laptop (`pull_policy: never`), never pulled from a registry |
 | `web` | `streamlit run parlaytracker/app/main.py --server.address 0.0.0.0 --server.port 8501 --server.headless true` | Published on `127.0.0.1:8501` only |
 | `worker` | `python -m parlaytracker.worker` | Exactly one (the advisory lock in 8.1 is the safety net) |
 
@@ -1176,15 +1186,15 @@ The app runs on one dedicated laptop at home. Nothing is exposed to the internet
 `DEV_LOGIN` is never set here.
 
 **Updates (`deploy/update.sh`, run by a systemd timer every 5 minutes)**
-1. `git fetch origin main`. If nothing changed, stop.
+1. `git fetch origin main`. If that commit is already deployed (recorded in `/var/lib/parlaytracker/deployed`), stop.
 2. `git reset --hard origin/main` in the deploy checkout, which never holds local changes.
 3. `docker compose build`, then `docker compose run --rm migrate`, then `docker compose up -d`.
-4. If any step fails, stop and leave the running containers untouched. Log every step to the systemd journal.
+4. If any step fails, stop and leave the running containers untouched; the next run tries again, because the commit wasn't recorded as deployed. Log every step to the systemd journal.
 
 Only `main` ever runs. Nothing on GitHub can push code to the laptop, because it only pulls; this matters while the repository is public. If the repository is made private, the laptop needs a read-only deploy key.
 
 **Backups (`deploy/backup.sh`, run nightly by a systemd timer)**
-- `pg_dump -Fc` into `/var/backups/parlaytracker/`, keeping 14 days.
+- `pg_dump -Fc` into `/var/backups/parlaytracker/`, keeping 14 days. The timer runs at 10:30 UTC, after every US game has finished.
 - Copy each dump off the laptop with `rclone` to a destination the users choose, such as a cloud drive. A backup that only lives on the laptop doesn't count.
 - Document the restore procedure in `deploy/README.md`, and test it once during Phase 2.
 
@@ -1198,6 +1208,10 @@ Only `main` ever runs. Nothing on GitHub can push code to the laptop, because it
 The user can run it themselves, or a Claude session started on the laptop with `claude remote-control` can run it for them.
 
 **Status (`deploy/status.sh`).** Prints container state, the last update, the last backup and every `source_health` row.
+
+**Other scripts.** `deploy/compose.sh` runs `docker compose` with the right project, file and `.env`. `deploy/restore.sh` replaces the database from a dump, after confirmation. `deploy/lib.sh` holds what they share. `deploy/README.md` is the step-by-step guide for the user.
+
+**CI** builds the image and runs this stack on every push: the web app answers on localhost only, the worker writes its heartbeat, and a backup restores (section 11).
 
 **When the laptop is off or offline,** the worker stops:
 - closing lines for games in that window are lost for good;
@@ -1300,7 +1314,7 @@ The order is set by what can't be recovered later. Closing lines can never be ba
   - halftime, end-of-period and delay status names, and the live `period`/`clock` fields. These need a live game: record one with `RECORD_EVENT_IDS` (6.1);
   - whether `site.api.espn.com` also blocks the laptop's home connection (the canary shows it on first start).
 - **The Odds API:** `player_points` and `player_points_alternate` on an NBA or NHL game, and whether Caesars (`williamhill_us`) appears for any game.
-- **Tailscale:** that `Tailscale-User-Login` reaches Streamlit's `st.context.headers` (9.1).
+- **Tailscale:** that real Tailscale Serve sends `Tailscale-User-Login` to Streamlit. A stand-in proxy already proved the header reaches `st.context.headers` through the websocket (9.1).
 - **Qwen via OpenRouter:** extraction quality on real slips (Phase 6).
 
 ---
