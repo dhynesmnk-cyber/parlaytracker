@@ -33,15 +33,9 @@ curl -fsSL https://raw.githubusercontent.com/dhynesmnk-cyber/parlaytracker/main/
 sudo bash setup.sh
 ```
 
-Until pull request #4 is merged, these files only exist on its branch. Use this instead:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/dhynesmnk-cyber/parlaytracker/claude/vigilant-sagan-acmryz/deploy/setup.sh -o setup.sh
-sudo BRANCH=claude/vigilant-sagan-acmryz bash setup.sh
-```
-
-After the merge, run `sudo bash setup.sh` once more with no `BRANCH`, so the laptop follows
-`main`.
+The laptop follows `main`: whatever is merged there is deployed automatically. To try a branch
+before it's merged, run `sudo BRANCH=<branch> bash setup.sh`, then run `sudo bash setup.sh`
+again afterwards to go back to `main`.
 
 The script:
 - installs Docker and Tailscale, and asks you to sign the laptop in to Tailscale;
