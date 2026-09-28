@@ -24,9 +24,9 @@ Priorities, in order:
 | Decision | Choice |
 |---|---|
 | Bet types | Singles, parlays and SGPs |
-| Users | Two, both signed in. Analytics are pooled; every slip records who logged it |
-| Hosting | A small always-on budget is accepted: web process, worker process and Postgres |
-| AI | Qwen models via Alibaba Cloud Model Studio only. No Anthropic models |
+| Users | Two, identified by their Tailscale login. Analytics are pooled; every slip records who logged it |
+| Hosting | A dedicated always-on laptop at home running Docker Compose (web, worker, Postgres), reachable only over Tailscale (section 12) |
+| AI | Qwen models only, through OpenRouter's OpenAI-compatible API (section 6.3). No Anthropic models |
 | Frontend | Streamlit only |
 | Live tracking | NFL only. NBA, NHL and MLB slips are logged and settled after the game, but not tracked during it |
 | Data ingestion | Polling only |
@@ -66,30 +66,33 @@ Sports: NFL, NBA, MLB, NHL.
 ## 2. Architecture
 
 ```
-browser ──▶ web (Streamlit) ──▶ Qwen vision API      (screenshot upload only)
-                 │           ──▶ ESPN                 (game and roster pickers, cached)
-                 ▼
-            PostgreSQL ◀────── worker (APScheduler) ──▶ ESPN, with host failover  (NFL live; finals for all sports)
-                                                    ──▶ nflverse                  (next-day NFL verification)
-                                                    ──▶ The Odds API              (closing lines)
+phone ──▶ Tailscale Serve ──▶ web (Streamlit) ──▶ Qwen via OpenRouter  (screenshot upload only)
+                                   │           ──▶ ESPN                 (game and roster pickers, cached)
+                                   ▼
+                              PostgreSQL ◀────── worker (APScheduler) ──▶ ESPN, with host failover  (NFL live; finals for all sports)
+                                                                      ──▶ nflverse                  (next-day NFL verification)
+                                                                      ──▶ The Odds API              (closing lines)
 ```
 
+Everything in the box from Tailscale Serve to PostgreSQL runs on one laptop (section 12).
+
 - There are two processes and one database. The processes share nothing except Postgres.
-- **web** is the UI. It may sleep when nobody is using it.
+- **web** is the UI. It listens only on the laptop itself; Tailscale Serve is the only way in (section 9.1).
 - **worker** runs every background job. It is always on and holds no state except in-memory backoff timers, so after a restart it rebuilds everything from the database.
 - There is no FastAPI and no other service.
 
 ### 2.1 Stack
 
 - Python 3.12
-- Streamlit ≥ 1.42, installed as `streamlit[auth]`. The features used are `st.navigation`, `st.fragment(run_every=...)` and `st.login`
+- Streamlit ≥ 1.42. The features used are `st.navigation`, `st.fragment(run_every=...)` and `st.context.headers`
 - SQLAlchemy 2.0 (typed ORM), Alembic, psycopg 3
-- PostgreSQL 15 or newer, from any managed provider. The code only knows `DATABASE_URL`
+- PostgreSQL 16, in a Docker container on the laptop. The code only knows `DATABASE_URL`
 - APScheduler 3.x, pinned `<4` because 4.x has a different API
 - httpx for all outbound HTTP
-- The `openai` SDK, used for Qwen's OpenAI-compatible endpoint
+- The `openai` SDK, pointed at OpenRouter's OpenAI-compatible endpoint for Qwen
 - rapidfuzz, pandas, plotly, Pillow, pydantic ≥ 2, pydantic-settings
 - `nflreadpy`, used only for next-day NFL verification (section 6.4)
+- Docker Compose and Tailscale on the laptop (section 12)
 - Dev: pytest, respx, ruff
 - **Not used:** FastAPI, streamlit-autorefresh, nfl_data_py (deprecated), nba_api, Playwright
 
@@ -125,7 +128,7 @@ parlaytracker/
     pages/log.py  screenshot.py  live.py  analytics.py  review.py  settings.py
   cli.py             # maintenance commands, e.g. export a raw sample as a test fixture
 migrations/          # Alembic
-scripts/start-web.sh # writes .streamlit/secrets.toml from env, then execs streamlit
+deploy/              # laptop setup, Docker Compose, auto-update and backup (section 12)
 tests/
   fixtures/espn/  fixtures/odds_api/  fixtures/qwen/
   unit/  db/  worker/  app/
@@ -145,15 +148,16 @@ Rules:
 | `DISPLAY_TZ` | yes | An IANA name such as `Europe/London`. Used only for display |
 | `ODDS_API_KEY` | from phase 3 | |
 | `ODDS_API_RESERVE` | no | Default 50. Credits below this are never spent automatically |
-| `DASHSCOPE_API_KEY` | from phase 6 | Must be issued in the same region as `DASHSCOPE_BASE_URL` |
-| `DASHSCOPE_BASE_URL` | no | Default `https://dashscope-intl.aliyuncs.com/compatible-mode/v1` |
-| `QWEN_VISION_MODEL` | no | Default `qwen-vl-max`. Model names change, so check Model Studio |
+| `QWEN_API_KEY` | from phase 6 | An OpenRouter API key |
+| `QWEN_BASE_URL` | no | Default `https://openrouter.ai/api/v1` |
+| `QWEN_VISION_MODEL` | no | Default `qwen/qwen3-vl-32b-instruct` (section 6.3) |
 | `MIN_SAMPLE` | no | Default 30 (section 10.3) |
 | `RECORD_EVENT_IDS` | no | Comma-separated ESPN event IDs. Every response for these events is saved to `raw_samples` (section 8.3) |
-| Auth values | yes | Section 9.1 |
+| `ALLOWED_LOGINS` | yes, for web | Comma-separated Tailscale login names allowed to use the app, compared case-insensitively (section 9.1). If it is empty, nobody gets in |
+| `DEV_LOGIN` | no | Local development only: the login to assume when no Tailscale header is present. Never set on the laptop |
 
 - Every timestamp is stored in UTC (`timestamptz`) and converted to `DISPLAY_TZ` only in the UI.
-- A "game day" for ESPN scoreboard requests is the US Eastern calendar date, so a Sunday-night NFL game belongs to Sunday. Confirm this against a recorded fixture (section 15).
+- A "game day" for ESPN scoreboard requests is the US Eastern calendar date, so a Sunday-night NFL game belongs to Sunday. Verified: `dates=20260927` includes the 8:20pm ET game that starts at 00:20 UTC on the Monday.
 
 ---
 
@@ -614,6 +618,7 @@ This API is unofficial, free and needs no key. One parser covers all four sports
 - In August 2026, `site.api.espn.com` began answering some clients with 403 "You don't have permission". Switching to `site.web.api.espn.com`, or replacing a browser User-Agent with a non-browser one, fixed it.
 - Frequent polling also produced 403s.
 - In September 2026, date-range queries (`dates=A-B`) stopped working. Single dates still work.
+- **Observed on 2026-09-28 from a cloud server:** `site.api.espn.com` returned Akamai's HTML "Access Denied" (403), while `site.web.api.espn.com` and `cdn.espn.com` returned 200. The laptop's home connection may fare better; the canary shows it on first start.
 
 So the same paths are served from several hosts, each treated as its own provider with its own circuit breaker (section 8.3). All hosts share ESPN's backend, so failover covers a host-level block but not a full ESPN outage. For NFL results, nflverse (section 6.4) is the independent second source.
 
@@ -621,7 +626,7 @@ So the same paths are served from several hosts, each treated as its own provide
 |---|---|---|
 | `espn_web` | `site.web.api.espn.com` | Primary |
 | `espn_site` | `site.api.espn.com` | Fallback |
-| `espn_cdn` | `cdn.espn.com/core/{league}/game?xhr=1&gameId={id}` | Third, **only if verified** (section 15): believed to wrap the summary JSON in `gamepackageJSON`. Unwrap it and reuse the summary parser |
+| `espn_cdn` | `cdn.espn.com/core/{league}/game?xhr=1&gameId={id}` | Third. Verified: `gamepackageJSON` contains `header` and a `boxscore` identical to the summary's. Unwrap it and reuse the summary parser |
 
 Paths on the first two hosts (prefix `/apis/site/v2/sports`):
 
@@ -633,6 +638,8 @@ Paths on the first two hosts (prefix `/apis/site/v2/sports`):
 
 `{sport}/{league}` is one of `football/nfl`, `basketball/nba`, `baseball/mlb` or `hockey/nhl`.
 
+Roster responses (verified): `athletes` is a list of groups (`offense`, `defense`, `specialTeam`, `injuredReserveOrOut`, `suspended`, `practiceSquad`), each with `items` carrying `id`, `fullName`, `position.abbreviation` and `status`. Offer every group in the player picker, with injured and suspended players last.
+
 Request rules (enforced in `http.py`, for both web and worker):
 - **User-Agent:** a fixed, honest, non-browser string: `ParlayTracker/1.0`. Never a spoofed browser string.
 - **Headers:** `Accept: application/json` and gzip. Use one shared client with keep-alive, and no cookies.
@@ -641,25 +648,39 @@ Request rules (enforced in `http.py`, for both web and worker):
 
 Rules for parsers:
 - **Record real responses as fixtures in `tests/fixtures/espn/` before writing any parser.** For each sport, record at least one scheduled, one in-progress, one final, one overtime and one postponed game. For the NFL, also record:
-  - a halftime game and a weather-delayed game;
-  - a box score in which a player who played has zero receptions;
+  - a halftime game and a weather-delayed game (only possible during a live game: use the recorder, section 8.3);
+  - a box score with a targeted player who made zero receptions;
   - an Akamai "Access Denied" 403 body, which is HTML, not JSON.
-- Parse player stats by the column `keys` or `labels` arrays, never by position.
+- Parse player stats by the column `keys` array (e.g. `receivingYards`), never by position or by the display `labels`.
+- Scores and stats arrive as strings (`"24"`); convert them in the parser.
 - Validate the part of each response you use with a Pydantic model, so a format change raises a `schema` failure (section 8.3) instead of producing wrong values.
 - The parser returns typed dataclasses. Nothing outside `espn.py` touches raw JSON.
 - Treat every field as optional. A missing field is a parse error for that event only.
-- Map ESPN's status to `EventStatus`: halftime and end of period become `break`, and weather or other stoppages become `delayed`.
+- Map ESPN's status to `EventStatus` by `status.type.name`, falling back to `status.type.state` (`pre`, `in`, `post`) for names you don't recognise, and log those. Verified so far:
 
-Stat mapping. Confirm each column against the fixtures:
+  | ESPN `status.type` | `EventStatus` |
+  |---|---|
+  | `STATUS_SCHEDULED`, state `pre` | `scheduled` |
+  | `STATUS_FINAL`, state `post` (overtime: period 5, detail "Final/OT") | `final` |
+  | `STATUS_POSTPONED`, state `post`, `completed` false | `postponed` |
+  | Halftime and end-of-period names (expected `STATUS_HALFTIME`, `STATUS_END_PERIOD`) | `break` (to verify live) |
+  | Delay names (expected to contain `DELAY`) | `delayed` (to verify live) |
+  | Any other state `in` | `in_progress` |
 
-| Market | Box-score group | Column |
+  Note that a postponed game has state `post`: never treat `post` alone as final.
+
+Stat mapping (verified against real box scores, 2026-09-28):
+
+| Market | Box-score group (`statistics[].name`) | Column key |
 |---|---|---|
-| `player_receptions` | receiving | REC |
-| `player_receiving_yards` | receiving | YDS |
-| `player_rushing_yards` | rushing | YDS |
-| `player_passing_yards` | passing | YDS |
-| `player_points` (NBA) | player stats | PTS |
-| `player_points` (NHL) | skater stats | G + A, or PTS if present |
+| `player_receptions` | `receiving` | `receptions` |
+| `player_receiving_yards` | `receiving` | `receivingYards` |
+| `player_rushing_yards` | `rushing` | `rushingYards` |
+| `player_passing_yards` | `passing` | `passingYards` |
+| `player_points` (NBA) | the single unnamed group | `points` |
+| `player_points` (NHL) | `forwards` and `defenses` | `goals` + `assists` (there is no points column) |
+
+NBA athletes also carry `didNotPlay` and `reason`; use them to identify a player who didn't play.
 
 Plausibility bounds. A response with any value outside these is rejected as `implausible` (section 8.3):
 
@@ -670,18 +691,20 @@ Plausibility bounds. A response with any value outside these is rejected as `imp
 | Passing yards | −30 to 700 |
 | Receptions | 0 to 25 |
 
-**Known trap:** an NFL player who played but made no receptions does not appear in the receiving table at all. Absence therefore means neither zero nor void. Section 7.1 settles it from snap-count evidence, or sends it to Review.
+**Known trap:** the receiving table lists every **targeted** player, including those with 0 receptions, but a player who was never targeted doesn't appear at all, whether or not he played. Absence therefore means neither zero nor void. Section 7.1 settles it from snap-count evidence, or sends it to Review.
 
 ### 6.2 The Odds API: closing lines only
 
 - The free tier gives 500 credits a month.
 - A live odds call costs (number of markets) × (number of regions) credits.
 - Historical odds cost 10× that, so they are not used.
-- Read `x-requests-remaining` from every response and store it in `source_health.quota_remaining`.
+- Read `x-requests-remaining` from every response and store it in `source_health.quota_remaining`. `x-requests-last` gives the cost of that call.
+- Verified: `/v4/sports` and `/v4/sports/{sport}/events` cost 0 credits.
+- The account had already used 49 credits this month before the build began, so budget from `x-requests-remaining`, never from a fixed monthly total.
 
 Sport keys: `americanfootball_nfl`, `basketball_nba`, `baseball_mlb`, `icehockey_nhl`.
 
-Market keys. Verify them against the Odds API markets list and keep them in one dict in `resolve.py`:
+Market keys, kept in one dict in `resolve.py`. All NFL keys were verified with one call for a real game, which cost 14 credits (14 markets × 1 region); `player_points` and `player_points_alternate` are still to verify on an NBA or NHL game:
 
 | Market | Main key | Alternate key |
 |---|---|---|
@@ -696,25 +719,37 @@ Market keys. Verify them against the Odds API markets list and keep them in one 
 
 Matching:
 - **Events:** resolve `odds_api_event_id` once, using `/v4/sports/{sport_key}/events`. Both team names must match through the team alias table, and `commence_time` must be within 3 hours of `start_time`. Cache the ID on `events`.
-- **Players:** a player-prop outcome carries the player's name in its `description` field. Match it against `legs.player_name` with rapidfuzz, requiring a score of at least 90. Otherwise there is no match.
+- **Players:** a player-prop outcome carries the player's name in its `description` field, `name` is `Over` or `Under`, and the line is `point`. Match `description` against `legs.player_name` with rapidfuzz, requiring a score of at least 90. Otherwise there is no match.
+- **Team names** are full names (e.g. `Chicago Bears`), matching ESPN's `displayName`.
+- **Bookmakers** returned for an NFL game with `regions=us` (2026-09-28): `draftkings`, `fanduel`, `betmgm`, `betrivers`, `betus`, `lowvig`, `betonlineag`, `mybookieag`, `bovada`. Caesars (`williamhill_us`) was **not** returned, so Caesars legs fall through to the median of the other books (section 8.2).
 
 ### 6.3 Qwen: screenshot extraction only
 
-- Call the OpenAI-compatible endpoint with the `openai` SDK: `OpenAI(api_key=DASHSCOPE_API_KEY, base_url=DASHSCOPE_BASE_URL)`.
+Qwen is reached through **OpenRouter**, which serves Qwen's vision models behind an OpenAI-compatible API. Alibaba's own DashScope service is no longer used.
+
+- Call it with the `openai` SDK: `OpenAI(api_key=QWEN_API_KEY, base_url=QWEN_BASE_URL)`.
+- **Model:** `qwen/qwen3-vl-32b-instruct` by default. On 2026-09-28 it cost $0.104 per million input tokens and $0.416 per million output tokens, which is well under a tenth of a cent per slip, and it supports structured outputs.
+  - Free alternative: `qwen/qwen3.8-27b:free`. It is limited to 20 requests a minute and 50 a day, or 1,000 a day once $10 of credit has been bought. It supports structured outputs but not plain JSON mode. Free endpoints may also be withdrawn at short notice.
+  - Changing model is only a `QWEN_VISION_MODEL` setting.
+- **Privacy:** some providers, especially behind free endpoints, may retain or train on inputs. Slips show stakes and possibly account details, so turn off training-permitted providers in OpenRouter's privacy settings.
 - Make **one** call per screenshot:
-  - `chat.completions.create(model=QWEN_VISION_MODEL, temperature=0, timeout=45, ...)`
+  - `chat.completions.create(model=QWEN_VISION_MODEL, temperature=0, timeout=45, response_format={"type": "json_schema", ...})` with `ExtractedSlip.model_json_schema()` as the schema.
   - A single user message containing the image as a base64 data URI plus the text prompt.
-- The prompt includes `ExtractedSlip.model_json_schema()` and says:
+- The prompt also includes the schema and says:
   - transcribe exactly what is on the slip, and do not guess;
   - use `null` for anything not visible;
   - give odds as signed integers;
   - return only JSON.
 - Mapping sportsbook wording to `MarketType` is done by the alias table in `resolve.py`, not by another model call.
-- Cost is per token: fractions of a cent per slip at this volume, but not zero. The upload page sits behind login, so nobody else can spend it.
+- Cost is per token: fractions of a cent per slip at this volume, but not zero. The app is reachable only over Tailscale, so nobody else can spend it.
 
 ### 6.4 nflverse: independent NFL results
 
-nflverse publishes NFL data built from the league's own game data, independent of ESPN. It is free, and it is downloaded from GitHub releases through `nflreadpy`. It is not live: it is published overnight, and complete weekly stats are expected by Tuesday. Confirm the timing (section 15).
+nflverse publishes NFL data built from the league's own game data, independent of ESPN. It is free, and `nflreadpy` downloads it from GitHub release assets (`github.com` redirecting to `release-assets.githubusercontent.com`). It is not live; it is published overnight.
+
+Verified on 2026-09-28:
+- Sunday's (week 3) player stats and snap counts were already published by Monday afternoon.
+- Across 7 games and 290 player stat lines, ESPN and nflverse agreed on every one, and every ESPN athlete ID mapped. So `verify_nfl` should rarely flag anything other than genuine stat corrections.
 
 It is used only by the worker, for two jobs:
 - **checking** every NFL leg the next day (`verify_nfl`, section 7.1);
@@ -722,10 +757,10 @@ It is used only by the worker, for two jobs:
 
 | Dataset (`nflreadpy`) | Used for | ESPN link |
 |---|---|---|
-| `load_schedules()` | Final scores | `espn` column = ESPN event ID |
-| `load_players()` | Player ID mapping | `espn_id` ↔ `gsis_id` |
-| `load_player_stats()` (weekly) | Receptions, receiving, rushing and passing yards | Via `gsis_id` |
-| `load_snap_counts()` | Did the player take a snap? | Via the players table's PFR ID |
+| `load_schedules()` | Final scores (`home_score`, `away_score`, `overtime`) | `espn` column = ESPN event ID (a string) |
+| `load_players()` | Player ID mapping | `espn_id` (a string) ↔ `gsis_id` ↔ `pfr_id` |
+| `load_player_stats()` (weekly) | `receptions`, `receiving_yards`, `rushing_yards`, `passing_yards` | `player_id` = `gsis_id`, plus `game_id` |
+| `load_snap_counts()` | Did the player take a snap? (`offense_snaps`) | `pfr_player_id` = the players table's `pfr_id`, plus `game_id` |
 
 Rules:
 - Map players only through these ID columns; never by name. A leg whose player can't be mapped stays unverified. That is shown in the UI, but not added to the Review queue.
@@ -917,20 +952,23 @@ Breaker transitions are written to `source_health` immediately; the hourly count
 
 **Per-event errors.** A parse error for one event goes in `events.last_error` and does not stop other events updating.
 
-**Visibility.** Log to stdout, where Fly collects it. But failures must be visible in the **UI** (sections 9.2 and 9.4), not only in the logs.
+**Visibility.** Log to stdout, where Docker collects it (`docker compose logs`). But failures must be visible in the **UI** (sections 9.2 and 9.4), not only in the logs.
 
 ---
 
 ## 9. Frontend (Streamlit)
 
-### 9.1 Auth
+### 9.1 Auth (Tailscale identity)
 
-- Use `st.login` with an OIDC provider (Google). Configure it in the `[auth]` block of `secrets.toml`, alongside an `allowed_emails` list containing the two users.
-- Every page runs a guard:
-  - not logged in: show a login button;
-  - logged in but not on the allowed list: stop.
-- `logged_by` is `st.user.email`.
-- Streamlit reads auth configuration from `.streamlit/secrets.toml`, not from environment variables. `scripts/start-web.sh` therefore writes that file from Fly secrets at startup. Never commit it.
+- The app is reachable only through Tailscale Serve on the laptop (section 12). Streamlit is published on `127.0.0.1` only, so no other device can reach it directly.
+- Tailscale Serve adds a `Tailscale-User-Login` header (e.g. `alice@example.com`) to every request it proxies. The app reads it with `st.context.headers`.
+- Every page runs a guard (`app/auth.py`):
+  - **login in `ALLOWED_LOGINS`:** continue, with `logged_by` set to that login;
+  - **header missing:** if `DEV_LOGIN` is set (local development only), use it; otherwise stop with "Open ParlayTracker through Tailscale";
+  - **any other login:** stop with "This Tailscale account isn't allowed".
+- The header is trustworthy only because the app listens on localhost behind Serve. Never expose the port any other way: no Tailscale Funnel, no router port forwarding.
+- There is no password and no OAuth provider. Signing in to Tailscale (with Google, Microsoft, Apple, GitHub and so on) is the login.
+- Verify at build time that the header reaches `st.context.headers` for the app's websocket session (section 15).
 
 ### 9.2 Navigation
 
@@ -1098,6 +1136,7 @@ Tags are for context only. Suggested categories: situation, injury, weather, mat
   - the final settles correctly after the 10-minute gate.
 - **Request budget.** Drive `poll_nfl_live` through a simulated 14-game Sunday and assert that ESPN requests stay within the limits in 6.1.
 - **App tests:** use `streamlit.testing.v1.AppTest` for:
+  - the auth guard: an allowed login, another login, and a missing header with and without `DEV_LOGIN`;
   - Log: a single, a parlay, an SGP and validation errors;
   - Screenshot: success and failure paths, with mocked extraction;
   - Review actions;
@@ -1106,52 +1145,66 @@ Tags are for context only. Suggested categories: situation, injury, weather, mat
 
 ---
 
-## 12. Deployment (Fly.io)
+## 12. Deployment (home laptop + Tailscale)
 
-```toml
-app = "parlaytracker"
-primary_region = "ams"
+The app runs on one dedicated laptop at home. Nothing is exposed to the internet; the only way in is Tailscale.
 
-[processes]
-  web = "./scripts/start-web.sh"          # writes secrets.toml, then: streamlit run parlaytracker/app/main.py --server.port 8080 --server.address 0.0.0.0 --server.headless true
-  worker = "python -m parlaytracker.worker"
+**The laptop**
+- 64-bit, at least 4 GB RAM (8 GB is comfortable), about 20 GB free disk, always plugged in. A working battery rides out short power cuts.
+- Ubuntu Server 24.04 LTS.
+- It never sleeps, closing the lid does nothing (`HandleLidSwitch=ignore`), and the BIOS "power on after AC loss" setting is on if there is one.
 
-[deploy]
-  release_command = "alembic upgrade head"
+**Services (`deploy/docker-compose.yml`).** One image serves `migrate`, `web` and `worker`. Every service uses `restart: unless-stopped` except `migrate`.
 
-[http_service]
-  internal_port = 8080
-  force_https = true
-  auto_stop_machines = "stop"
-  auto_start_machines = true
-  min_machines_running = 0
-  processes = ["web"]
+| Service | Runs | Notes |
+|---|---|---|
+| `db` | `postgres:16` | Data in a named volume; not published outside the Compose network |
+| `migrate` | `alembic upgrade head` | One-shot; must succeed before `web` and `worker` start |
+| `web` | `streamlit run parlaytracker/app/main.py --server.address 0.0.0.0 --server.port 8501 --server.headless true` | Published on `127.0.0.1:8501` only |
+| `worker` | `python -m parlaytracker.worker` | Exactly one (the advisory lock in 8.1 is the safety net) |
 
-  [[http_service.checks]]
-    method = "GET"
-    path = "/_stcore/health"
-    interval = "30s"
-    timeout = "5s"
-    grace_period = "20s"
+**Tailscale**
+- Installed on the laptop itself (not in Docker) and on both phones, with both users in the same tailnet. The free Personal plan covers up to 6 users.
+- `tailscale serve --bg 8501` publishes the app at `https://<laptop-name>.<tailnet>.ts.net`, to tailnet members only. Tailscale provides the HTTPS certificate and adds the identity headers (section 9.1).
+- Never use Tailscale Funnel, which would make the app public.
 
-[[vm]]
-  processes = ["web"]
-  memory = "512mb"
+**Configuration.** `/opt/parlaytracker/.env`, mode 600, owned by root, never committed:
+- `DATABASE_URL` (pointing at the `db` service) and `POSTGRES_PASSWORD`;
+- `DISPLAY_TZ` and `ALLOWED_LOGINS`;
+- `ODDS_API_KEY` and `QWEN_API_KEY`.
 
-[[vm]]
-  processes = ["worker"]
-  memory = "256mb"
-```
+`DEV_LOGIN` is never set here.
 
-- The worker has no HTTP service, so Fly never auto-stops it. Run exactly one worker machine (`fly scale count worker=1`); the advisory lock (8.1) is the safety net.
-- The web process may sleep. No data capture depends on it.
-- Secrets: `DATABASE_URL`, `DISPLAY_TZ`, `ODDS_API_KEY`, `DASHSCOPE_API_KEY` and the auth values.
-- Postgres can come from any managed provider running 15 or newer.
-- This fixes four problems in the current `fly.toml` and `Dockerfile`:
-  - `memory` and `memory_mb` are set to conflicting values;
-  - Streamlit listens on 8501 while `internal_port` is 8080;
-  - there is no worker;
-  - auto-stop would kill background jobs.
+**Updates (`deploy/update.sh`, run by a systemd timer every 5 minutes)**
+1. `git fetch origin main`. If nothing changed, stop.
+2. `git reset --hard origin/main` in the deploy checkout, which never holds local changes.
+3. `docker compose build`, then `docker compose run --rm migrate`, then `docker compose up -d`.
+4. If any step fails, stop and leave the running containers untouched. Log every step to the systemd journal.
+
+Only `main` ever runs. Nothing on GitHub can push code to the laptop, because it only pulls; this matters while the repository is public. If the repository is made private, the laptop needs a read-only deploy key.
+
+**Backups (`deploy/backup.sh`, run nightly by a systemd timer)**
+- `pg_dump -Fc` into `/var/backups/parlaytracker/`, keeping 14 days.
+- Copy each dump off the laptop with `rclone` to a destination the users choose, such as a cloud drive. A backup that only lives on the laptop doesn't count.
+- Document the restore procedure in `deploy/README.md`, and test it once during Phase 2.
+
+**Setup (`deploy/setup.sh`).** Idempotent, so it's safe to re-run. It:
+- installs Docker and Tailscale;
+- clones the repository to `/opt/parlaytracker`;
+- creates `.env` from a template, prompting for each value;
+- installs the systemd timers;
+- starts the services and runs `tailscale serve`.
+
+The user can run it themselves, or a Claude session started on the laptop with `claude remote-control` can run it for them.
+
+**Status (`deploy/status.sh`).** Prints container state, the last update, the last backup and every `source_health` row.
+
+**When the laptop is off or offline,** the worker stops:
+- closing lines for games in that window are lost for good;
+- live tracking stops;
+- results still settle automatically once it's back (sections 7.1 and 8.1).
+
+The worker-heartbeat banner (9.2) shows when this has happened.
 
 ---
 
@@ -1171,9 +1224,13 @@ The order is set by what can't be recovered later. Closing lines can never be ba
 
 ### Phase 2: Logging, then deploy and start using it
 - ESPN client (scoreboard and roster only) with fixtures, following the request rules in 6.1 from the start.
-- Auth, and the Log, Review (manual settlement and manual closing line) and Settings pages.
-- Deploy with web and an empty worker.
-- **Exit:** both users can log singles, parlays and SGPs from their phones; manual settlement works; data survives a redeploy.
+- Tailscale auth (9.1), and the Log, Review (manual settlement and manual closing line) and Settings pages.
+- The deployment files in section 12. Install them on the laptop with a worker that only writes its heartbeat.
+- **Exit:**
+  - both users can log singles, parlays and SGPs from their phones over Tailscale;
+  - manual settlement works;
+  - data survives a laptop reboot and an automatic update;
+  - a backup has been restored once to prove it works.
 
 ### Phase 3: Closing lines
 - Worker skeleton: heartbeat, `source_health`, the advisory lock, and the HTTP layer with the circuit breaker (8.3).
@@ -1216,35 +1273,35 @@ The order is set by what can't be recovered later. Closing lines can never be ba
 4. Every outbound request has a timeout. No job can crash the worker. Every failure is visible in the UI.
 5. Timestamps are stored in UTC.
 6. Only free data sources, and no scraping. Odds API spending is budgeted and keeps a reserve.
-7. Qwen models only; no Anthropic models.
+7. Qwen models only, reached through OpenRouter; no Anthropic models.
 8. Streamlit only: no separate API server, no JavaScript frontend, and data is ingested by polling.
 9. Exactly one worker instance.
 10. ESPN requests follow section 6.1: an honest User-Agent, single dates and the rate limits. A blocked or throttled provider is backed off, never hammered.
+11. The app is reachable only over Tailscale. Never expose it publicly: no Funnel, no port forwarding.
 
 ---
 
-## 15. Verify at build time
+## 15. Verification status
 
-This spec could not confirm the following. Check each one and update the spec:
-
+**Verified on 2026-09-28**, with the details in the sections named:
 - **ESPN:**
-  - which date the scoreboard's `dates` parameter uses for late games;
-  - the box-score column keys for each sport, especially NHL points;
-  - the shape of the roster endpoint;
-  - how ESPN reports halftime, end of period and weather delays, for the `break` and `delayed` mapping;
-  - whether `cdn.espn.com/core/nfl/game?xhr=1&gameId=` wraps the summary in `gamepackageJSON`. If not, drop the `espn_cdn` provider;
-  - whether ESPN blocks requests from Fly's `ams` region. The canary shows this on the first deploy; if it's blocked, move the worker to a US region.
-- **nflverse:**
-  - the `espn` column in `load_schedules()` and the `espn_id` column in `load_players()`;
-  - when weekly player stats and snap counts are published;
-  - how snap counts link to the players table (PFR ID).
-- **The Odds API:**
-  - the market keys in 6.2, especially `alternate_team_totals` and the `*_alternate` player keys;
-  - the credit cost of the events endpoint;
-  - the bookmaker keys for the seeded sportsbooks.
-- **Qwen:**
-  - the current vision model name in your region;
-  - whether it accepts `response_format={"type": "json_object"}` (use it if so).
+  - late games belong to their US Eastern date (3);
+  - box-score column keys for the NFL, NBA and NHL, and the roster shape (6.1);
+  - `cdn.espn.com` wraps the same box score as the summary (6.1);
+  - `site.api.espn.com` is blocked from a cloud server (6.1);
+  - the final, overtime and postponed statuses (6.1);
+  - targeted players with 0 receptions are listed (6.1).
+- **The Odds API:** the sport keys, all NFL market keys, the free events endpoint, and the bookmaker keys (6.2).
+- **nflverse:** ID columns, dataset columns, next-day publishing, and 290 of 290 stat lines agreeing with ESPN (6.4).
+- **Qwen:** DashScope replaced by OpenRouter; model availability and pricing (6.3).
+
+**Still to verify:**
+- **ESPN:**
+  - halftime, end-of-period and delay status names, and the live `period`/`clock` fields. These need a live game: record one with `RECORD_EVENT_IDS` (6.1);
+  - whether `site.api.espn.com` also blocks the laptop's home connection (the canary shows it on first start).
+- **The Odds API:** `player_points` and `player_points_alternate` on an NBA or NHL game, and whether Caesars (`williamhill_us`) appears for any game.
+- **Tailscale:** that `Tailscale-User-Login` reaches Streamlit's `st.context.headers` (9.1).
+- **Qwen via OpenRouter:** extraction quality on real slips (Phase 6).
 
 ---
 
@@ -1255,6 +1312,7 @@ This spec could not confirm the following. Check each one and update the spec:
 | ESPN | Free |
 | nflverse | Free |
 | The Odds API | Free (500 credits a month) |
-| Qwen | Fractions of a cent per screenshot |
-| Fly.io | Two small machines, with the worker always on and web sleeping: a few dollars a month |
-| Postgres | Depends on the provider |
+| Qwen via OpenRouter | Well under a tenth of a cent per screenshot, from prepaid credit |
+| Laptop | Electricity only |
+| Postgres | Free, on the laptop |
+| Tailscale | Free (Personal plan) |

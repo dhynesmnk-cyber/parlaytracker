@@ -34,7 +34,15 @@ def test_settings_from_env(env):
     assert s.record_event_ids == ["401", "402"]
     assert s.odds_api_key is None
     assert s.odds_api_reserve == 50
-    assert s.dashscope_base_url.startswith("https://dashscope-intl.aliyuncs.com/")
+    assert s.qwen_base_url == "https://openrouter.ai/api/v1"
+    assert s.qwen_vision_model == "qwen/qwen3-vl-32b-instruct"
+    assert s.allowed_logins == []
+    assert s.dev_login is None
+
+
+def test_allowed_logins_are_split_and_lowercased(env):
+    env.setenv("ALLOWED_LOGINS", "Alice@Example.com, bob@github ,")
+    assert Settings(_env_file=None).allowed_logins == ["alice@example.com", "bob@github"]
 
 
 def test_settings_reject_unknown_time_zone(env):

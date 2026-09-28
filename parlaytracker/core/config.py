@@ -23,11 +23,16 @@ class Settings(BaseSettings):
     display_tz: str
     odds_api_key: str | None = None
     odds_api_reserve: int = 50
-    dashscope_api_key: str | None = None
-    dashscope_base_url: str = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
-    qwen_vision_model: str = "qwen-vl-max"
+    # Qwen through OpenRouter's OpenAI-compatible API (SPEC.md section 6.3).
+    qwen_api_key: str | None = None
+    qwen_base_url: str = "https://openrouter.ai/api/v1"
+    qwen_vision_model: str = "qwen/qwen3-vl-32b-instruct"
     min_sample: int = 30
     record_event_ids: Annotated[list[str], NoDecode] = []
+    # Tailscale login names allowed to use the web app (section 9.1), compared lowercased.
+    allowed_logins: Annotated[list[str], NoDecode] = []
+    # Local development only: the login assumed when no Tailscale header is present.
+    dev_login: str | None = None
 
     @field_validator("database_url")
     @classmethod
@@ -43,12 +48,17 @@ class Settings(BaseSettings):
             raise ValueError(f"unknown IANA time zone: {v!r}") from e
         return v
 
-    @field_validator("record_event_ids", mode="before")
+    @field_validator("record_event_ids", "allowed_logins", mode="before")
     @classmethod
-    def _split_ids(cls, v: object) -> object:
+    def _split_list(cls, v: object) -> object:
         if isinstance(v, str):
             return [part.strip() for part in v.split(",") if part.strip()]
         return v
+
+    @field_validator("allowed_logins")
+    @classmethod
+    def _lowercase_logins(cls, v: list[str]) -> list[str]:
+        return [login.lower() for login in v]
 
 
 @lru_cache
