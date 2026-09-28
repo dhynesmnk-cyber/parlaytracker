@@ -123,8 +123,7 @@ None are verified yet; they all need network access:
 ## CI
 
 - **Run 1** on `1d789d7` [passed](https://github.com/dhynesmnk-cyber/parlaytracker/actions/runs/36452614623): ruff clean, pytest green. The Postgres service log shows every expected constraint rejection, so the database tests really ran; they weren't skipped.
-- **Next commit** (the one adding this file) changes the workflow in two ways:
+- **Run 2** on `efc7880` [passed](https://github.com/dhynesmnk-cyber/parlaytracker/actions/runs/36452792029). That commit changed the workflow in two ways:
   - the health check now names the database (`-d parlaytracker_test`), so it stops logging `FATAL: database "parlaytracker" does not exist`;
-  - it moves to `actions/checkout@v5` and `actions/setup-python@v6`, because GitHub warned that the v4/v5 actions target the deprecated Node 20.
-
-  Check that run is green before building on it.
+  - it moved to `actions/checkout@v5` and `actions/setup-python@v6`, because GitHub warned that the v4/v5 actions target the deprecated Node 20.
+- Later commits only touch this file. Check the latest run is green before building on it.
