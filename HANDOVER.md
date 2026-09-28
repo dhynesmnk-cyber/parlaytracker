@@ -6,7 +6,7 @@ For the next agent picking up ParlayTracker. Read [SPEC.md](SPEC.md) first: it i
 
 | | |
 |---|---|
-| Branch | `claude/vigilant-sagan-acmryz`, open as [dhynesmnk-cyber/parlaytracker#4](https://github.com/dhynesmnk-cyber/parlaytracker/pull/4). New commits on the branch update the PR |
+| Code | All on `main`. Phases 0–2 were merged in [dhynesmnk-cyber/parlaytracker#4](https://github.com/dhynesmnk-cyber/parlaytracker/pull/4). Work on a branch, and open a PR into `main`: the laptop deploys whatever is merged there |
 | Done | Phases 0 and 1, and the **code** for Phase 2 (SPEC.md section 13) |
 | Phase 2 still open | Its exit criteria need the real laptop: install it, log real slips from both phones over Tailscale, reboot, update, and restore a backup once (below) |
 | Next after that | Phase 3: closing lines |
@@ -91,7 +91,7 @@ export TEST_DATABASE_URL="$(.venv/bin/python scripts/dev_postgres.py)"
 1. The user follows `deploy/README.md`:
    - install Ubuntu Server;
    - set up Tailscale (MagicDNS and HTTPS certificates on);
-   - run `setup.sh` with `BRANCH=claude/vigilant-sagan-acmryz` until PR #4 is merged.
+   - run `setup.sh`, which follows `main`.
 
    Or they start `claude remote-control` on the laptop, and a session there does it.
 2. Then check the exit criteria in SPEC.md section 13:
