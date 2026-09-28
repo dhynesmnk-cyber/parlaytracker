@@ -2,7 +2,7 @@
 from datetime import UTC, datetime
 
 import pytest
-from sqlalchemy import Engine, select
+from sqlalchemy import Engine, select, text
 from sqlalchemy.orm import Session
 
 from parlaytracker.core.models import Event, Sport, Sportsbook, Tag
@@ -62,3 +62,12 @@ def tag(session: Session) -> Tag:
     session.add(t)
     session.flush()
     return t
+
+
+@pytest.fixture
+def clean(engine: Engine):
+    """For tests whose code commits for real (the worker's jobs): empty the tables after."""
+    yield
+    with engine.begin() as conn:
+        conn.execute(text("TRUNCATE slips, legs, leg_tags, events, source_health, raw_samples "
+                          "RESTART IDENTITY CASCADE"))

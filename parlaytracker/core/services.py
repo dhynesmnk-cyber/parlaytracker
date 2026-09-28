@@ -2,6 +2,7 @@
 
 Service functions flush but never commit: wrap calls in db.session_scope().
 """
+import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -30,6 +31,9 @@ from parlaytracker.core.models import (
 from parlaytracker.core.odds import decimal_odds, implied_probability, parlay_decimal
 from parlaytracker.core.schemas import LegIn, SlipIn
 from parlaytracker.core.settlement import LegOutcome, settle_leg, settle_slip
+from parlaytracker.ingest import guards
+
+log = logging.getLogger(__name__)
 
 # Warning thresholds (SPEC.md section 5).
 PARLAY_ODDS_TOLERANCE = Decimal("0.02")
@@ -315,6 +319,123 @@ def set_closing_line(session: Session, leg: Leg, *, closing_line: Decimal, closi
     leg.closing_opposite_odds = closing_opposite_odds
     leg.closing_source = source
     leg.closing_captured_at = now or _now()
+    session.flush()
+    return leg
+
+
+# --- Automatic settlement (SPEC.md sections 7.1 and 8.3) --------------------------------------
+
+# Nothing settles from a live value: an event must have been final this long (section 7.1).
+FINAL_GATE = timedelta(minutes=10)
+# nflverse publishes overnight, so a leg settled from it has no ESPN "final" to wait ten
+# minutes after; it needs the game to be over instead: kickoff plus the expected end.
+NFLVERSE_GAME_OVER_AFTER = timedelta(hours=4)
+AUTO_SOURCES = {DataSource.ESPN_WEB, DataSource.ESPN_SITE, DataSource.ESPN_CDN,
+                DataSource.NFLVERSE}
+
+
+def apply_event_reading(
+    session: Session, event: Event, *, status: EventStatus, home_score: int | None,
+    away_score: int | None, period: int | None = None, clock_seconds: int | None = None,
+    now: datetime | None = None, final_at: datetime | None = None,
+) -> guards.Verdict | None:
+    """Store what a provider says about an event, unless it is older than what we hold
+    (section 8.3). Returns the verdict, or None if the reading was refused.
+
+    `final_at` is for a backfill of a game that ended long ago: the time the game can be
+    said to have finished by. Otherwise it is the moment the worker first saw `final`.
+    """
+    now = now or _now()
+    event.last_polled_at = now
+    if not guards.accept_status_change(event.status, status):
+        log.warning("event %s: ignoring %s after final", event.espn_event_id, status)
+        return None
+    # A box score has no period or clock: compare it as if it hadn't moved.
+    keyed_period = event.period if period is None else period
+    keyed_clock = event.clock_seconds if period is None and clock_seconds is None \
+        else clock_seconds
+    new_key = guards.progress_key(event.sport, status, keyed_period, keyed_clock)
+    stored_key = guards.progress_key(event.sport, event.status, event.period,
+                                     event.clock_seconds)
+    verdict = guards.compare(new_key, stored_key) if new_key and stored_key else \
+        guards.Verdict.ADVANCE
+    if verdict is guards.Verdict.STALE:
+        log.info("event %s: discarded a stale response %s < %s", event.espn_event_id, new_key,
+                 stored_key)
+        return verdict
+    if verdict is guards.Verdict.CORRECTION and (event.home_score, event.away_score) != (
+            home_score, away_score):
+        log.warning("event %s: correction %s-%s -> %s-%s", event.espn_event_id,
+                    event.home_score, event.away_score, home_score, away_score)
+    elif None not in (event.home_score, home_score, event.away_score, away_score) and (
+            home_score < event.home_score or away_score < event.away_score):
+        log.warning("event %s: a score went down (overturned play?) %s-%s -> %s-%s",
+                    event.espn_event_id, event.home_score, event.away_score, home_score,
+                    away_score)
+    if verdict is guards.Verdict.ADVANCE:
+        event.last_progress_at = now
+    was_final = event.status is EventStatus.FINAL
+    event.status = status
+    event.home_score, event.away_score = home_score, away_score
+    if period is not None:
+        event.period = period
+    if clock_seconds is not None or period is not None:
+        event.clock_seconds = clock_seconds
+    if status is EventStatus.FINAL and not was_final:
+        event.final_at = final_at or now
+    event.last_error = None
+    session.flush()
+    return verdict
+
+
+def settle_leg_auto(session: Session, leg: Leg, *, final_value: Decimal, source: DataSource,
+                    now: datetime | None = None, note: str | None = None) -> Slip:
+    """Settle a pending leg from a provider's final value, then its slip.
+
+    The worker never changes a settled result (section 7.1), and never settles early:
+    ESPN values need the event to have been final for ten minutes; nflverse values need the
+    game to be over (four hours after kickoff).
+    """
+    now = now or _now()
+    if source not in AUTO_SOURCES:
+        raise ServiceError(f"{source} is not an automatic source")
+    if leg.result is not LegResult.PENDING:
+        raise ServiceError("the worker never changes a settled result")
+    if leg.market_type is MarketType.OTHER:
+        raise ServiceError("'other' legs are settled manually")
+    event = leg.event
+    if source is DataSource.NFLVERSE:
+        ready = event.start_time + NFLVERSE_GAME_OVER_AFTER <= now
+    else:
+        ready = (event.status is EventStatus.FINAL and event.final_at is not None
+                 and event.final_at + FINAL_GATE <= now)
+    if not ready:
+        raise ServiceError("the event has not been final for long enough to settle")
+    leg.result = settle_leg(leg.market_type, leg.line, final_value)
+    leg.final_value = final_value
+    leg.settlement_source = source
+    leg.settled_at = now
+    leg.needs_review = False
+    leg.review_reason = note  # e.g. "Played, no stat": kept for the record, not for Review
+    return refresh_slip(session, leg.slip, now)
+
+
+def flag_leg(session: Session, leg: Leg, reason: str) -> Leg:
+    """Send a leg to Review. Idempotent: an existing flag keeps its original reason."""
+    if not leg.needs_review:
+        leg.needs_review = True
+        leg.review_reason = reason
+        session.flush()
+    return leg
+
+
+def verify_leg(session: Session, leg: Leg, source: DataSource,
+               now: datetime | None = None) -> Leg:
+    """A second source agreed with the settled value (section 7.1)."""
+    if leg.result is LegResult.PENDING:
+        raise ServiceError("only a settled leg can be verified")
+    leg.verified_at = now or _now()
+    leg.verified_source = source
     session.flush()
     return leg
 

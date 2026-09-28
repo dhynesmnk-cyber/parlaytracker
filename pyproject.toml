@@ -20,6 +20,8 @@ dependencies = [
     # Phase 3
     "apscheduler>=3.10,<4",
     "rapidfuzz>=3.6",
+    # Phase 4
+    "nflreadpy>=0.1.5",
 ]
 
 [project.optional-dependencies]
