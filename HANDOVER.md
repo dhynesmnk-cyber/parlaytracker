@@ -119,4 +119,8 @@ Never paste keys into chat.
 ## CI
 
 - **Runs 1–2** (`1d789d7`, `efc7880`) passed. From run 2 the workflow names the database in the Postgres health check and uses `actions/checkout@v5` / `actions/setup-python@v6`.
-- **Phase 2** adds the `deploy` job. Check that the latest run on the PR is green before building on it.
+- **Run 9** on `d4fdc38` (Phase 2) [passed](https://github.com/dhynesmnk-cyber/parlaytracker/actions/runs/36494175532), including the new `deploy` job:
+  - the image built and the stack started in 40 s;
+  - the web app answered on `127.0.0.1:8501` only, and the worker heartbeat appeared;
+  - a backup (28 KB) restored a deleted row, and the app came back healthy.
+- Later commits only touch this file. Check the latest run on the PR is green before building on it.
