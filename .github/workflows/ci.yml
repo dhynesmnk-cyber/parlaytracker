@@ -17,15 +17,15 @@ jobs:
         ports:
           - 5432:5432
         options: >-
-          --health-cmd "pg_isready -U parlaytracker"
+          --health-cmd "pg_isready -U parlaytracker -d parlaytracker_test"
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
     env:
       TEST_DATABASE_URL: postgresql://parlaytracker:parlaytracker@localhost:5432/parlaytracker_test
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
           cache: pip
