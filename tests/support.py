@@ -3,6 +3,8 @@ answers with the real parsers on recorded fixtures, and an nflverse loader over 
 slice."""
 import json
 from datetime import UTC, date, datetime
+from itertools import count
+from decimal import Decimal
 from pathlib import Path
 
 import polars as pl
@@ -15,6 +17,7 @@ from parlaytracker.core.schemas import SlipIn
 from parlaytracker.ingest import espn
 from parlaytracker.ingest.router import AllProvidersFailed, Routed
 
+_LEG_IDS = count(10_000)  # ids for analytics_leg rows
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 
 # ARI @ SF, week 3: final 30-36, 2026-09-27 4:05 pm ET.
@@ -148,3 +151,19 @@ def nflverse_loader(patch=None):
     if patch:
         patch(frames)
     return lambda dataset, season: frames[dataset]
+
+
+def analytics_leg(result=None, odds=-110, line="45.5", **kw):
+    """A `LegRow` for the analytics unit tests, with sensible defaults."""
+    from parlaytracker.core.analytics import LegRow
+    from parlaytracker.core.models import LegResult, MarketType, SlipType
+
+    n = next(_LEG_IDS)
+    start = datetime(2026, 9, 27, 20, 5, tzinfo=UTC)
+    defaults = dict(
+        leg_id=n, slip_id=n, selection_key=("sel", n), logged_at=start.replace(hour=17),
+        start_time=start, sport=Sport.NFL, market=MarketType.GAME_TOTAL,
+        sportsbook="DraftKings", slip_type=SlipType.SINGLE, leg_count=1, is_placed=True,
+        logged_by="a@example.com", line=Decimal(line), odds=odds,
+        result=result or LegResult.WIN)
+    return LegRow(**{**defaults, **kw})
