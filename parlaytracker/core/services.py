@@ -297,8 +297,9 @@ def mark_cashed_out(session: Session, slip: Slip, amount: Decimal,
 
 def set_closing_line(session: Session, leg: Leg, *, closing_line: Decimal, closing_odds: int,
                      closing_opposite_odds: int | None = None,
+                     source: ClosingSource = ClosingSource.MANUAL,
                      now: datetime | None = None) -> Leg:
-    """Enter a closing line by hand (section 8.2, step 6)."""
+    """Record a closing line: by hand (section 8.2, step 6) or, from the worker, `odds_api`."""
     if leg.market_type is MarketType.OTHER:
         raise ServiceError("'other' legs have no closing line")
     if (closing_line * 2) % 1 != 0:
@@ -312,7 +313,7 @@ def set_closing_line(session: Session, leg: Leg, *, closing_line: Decimal, closi
     leg.closing_line = closing_line
     leg.closing_odds = closing_odds
     leg.closing_opposite_odds = closing_opposite_odds
-    leg.closing_source = ClosingSource.MANUAL
+    leg.closing_source = source
     leg.closing_captured_at = now or _now()
     session.flush()
     return leg

@@ -1,19 +1,20 @@
 """Background worker: `python -m parlaytracker.worker` (SPEC.md section 8).
 
-Phase 2 only holds the single-instance lock and writes a heartbeat, so the app can show when
-the worker is down. Phase 3 adds the scheduler and its jobs.
+Phase 3 runs two jobs: `heartbeat` and `capture_closing`. Later phases add the rest of the
+table in section 8.1.
 """
 import logging
 import signal
 import sys
-import threading
-from datetime import UTC, datetime
 
+from apscheduler.schedulers.blocking import BlockingScheduler
 from sqlalchemy import Connection, Engine, text
-from sqlalchemy.dialects.postgresql import insert
 
+from parlaytracker.core.config import get_settings
 from parlaytracker.core.db import make_engine
-from parlaytracker.core.models import HealthState, SourceHealth
+from parlaytracker.ingest.odds_api import OddsApiClient
+from parlaytracker.ingest.router import Breakers
+from parlaytracker.worker.jobs import ClosingCapture, guarded, heartbeat
 
 log = logging.getLogger("parlaytracker.worker")
 
@@ -21,6 +22,7 @@ log = logging.getLogger("parlaytracker.worker")
 # and spend Odds API credits twice (section 8.1).
 LOCK_KEY = 7_406_110_417
 HEARTBEAT_SECONDS = 60
+CAPTURE_SECONDS = 60
 
 
 def try_lock(conn: Connection) -> bool:
@@ -30,26 +32,19 @@ def try_lock(conn: Connection) -> bool:
     return bool(locked)
 
 
-def heartbeat(engine: Engine, now: datetime | None = None) -> None:
-    now = now or datetime.now(tz=UTC)
-    stmt = insert(SourceHealth).values(source="worker", state=HealthState.OK, last_success_at=now,
-                                       consecutive_failures=0, requests_last_hour=0,
-                                       errors_last_hour=0)
-    stmt = stmt.on_conflict_do_update(index_elements=[SourceHealth.source],
-                                      set_={"last_success_at": now, "state": HealthState.OK})
-    with engine.begin() as conn:
-        conn.execute(stmt)
-
-
-def run(engine: Engine, stop: threading.Event, interval: float = HEARTBEAT_SECONDS) -> None:
-    """Beat until `stop` is set. A failed beat is logged, never fatal."""
-    while True:
-        try:
-            heartbeat(engine)
-        except Exception:
-            log.exception("heartbeat failed")
-        if stop.wait(interval):
-            return
+def build_scheduler(engine: Engine, breakers: Breakers, odds: OddsApiClient | None,
+                    reserve: int) -> BlockingScheduler:
+    """Every job runs with coalesce=True, max_instances=1, misfire_grace_time=30."""
+    scheduler = BlockingScheduler(
+        timezone="UTC",
+        job_defaults={"coalesce": True, "max_instances": 1, "misfire_grace_time": 30})
+    scheduler.add_job(guarded(engine, "heartbeat", lambda: heartbeat(engine, breakers=breakers)),
+                      "interval", seconds=HEARTBEAT_SECONDS, id="heartbeat", name="heartbeat")
+    if odds is not None:
+        capture = ClosingCapture(engine, odds, breakers, reserve)
+        scheduler.add_job(guarded(engine, "capture_closing", capture), "interval",
+                          seconds=CAPTURE_SECONDS, id="capture_closing", name="capture_closing")
+    return scheduler
 
 
 def main() -> int:
@@ -59,11 +54,22 @@ def main() -> int:
     if not try_lock(lock_conn):
         log.error("another worker already holds the lock; exiting")
         return 1
-    stop = threading.Event()
-    for sig in (signal.SIGTERM, signal.SIGINT):
-        signal.signal(sig, lambda *_: stop.set())
-    log.info("worker started (Phase 2: heartbeat only)")
-    run(engine, stop)
+
+    settings = get_settings()
+    breakers = Breakers(engine)
+    breakers.load()
+    odds = None
+    if settings.odds_api_key is not None:
+        odds = OddsApiClient(settings.odds_api_key.get_secret_value(), breakers)
+    else:
+        log.warning("ODDS_API_KEY is not set: closing lines will not be captured")
+
+    scheduler = build_scheduler(engine, breakers, odds, settings.odds_api_reserve)
+    signal.signal(signal.SIGTERM, lambda *_: scheduler.shutdown(wait=False))
+    signal.signal(signal.SIGINT, lambda *_: scheduler.shutdown(wait=False))
+    guarded(engine, "heartbeat", lambda: heartbeat(engine, breakers=breakers))()  # at once
+    log.info("worker started (Phase 3: heartbeat%s)", ", closing lines" if odds else "")
+    scheduler.start()  # blocks until shutdown
     log.info("worker stopped")
     lock_conn.close()
     return 0

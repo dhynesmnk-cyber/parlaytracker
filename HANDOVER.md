@@ -7,10 +7,11 @@ For the next agent picking up ParlayTracker. Read [SPEC.md](SPEC.md) first: it i
 | | |
 |---|---|
 | Code | All on `main`. Phases 0–2 were merged in [dhynesmnk-cyber/parlaytracker#4](https://github.com/dhynesmnk-cyber/parlaytracker/pull/4). Work on a branch, and open a PR into `main`: the laptop deploys whatever is merged there |
-| Done | Phases 0 and 1, and the **code** for Phase 2 (SPEC.md section 13) |
+| Done | Phases 0 and 1, and the **code** for Phases 2 and 3 (SPEC.md section 13). Phase 3 is on branch `claude/elegant-pasteur-0qqx5i`, not yet merged |
 | Phase 2 still open | Its exit criteria need the real laptop: install it, log real slips from both phones over Tailscale, reboot, update, and restore a backup once (below) |
-| Next after that | Phase 3: closing lines |
-| Tests | 1,029 passing locally on Python 3.12 + PostgreSQL 16 (unit, database and Streamlit app tests) |
+| Phase 3 still open | Its exit criteria need a real game day with logged slips (below) |
+| Next after that | Phase 4: auto-settlement |
+| Tests | 1,111 passing locally on Python 3.12 + PostgreSQL 16 (unit, database and Streamlit app tests), plus 1 `live` test (`-m live`, 0 credits) |
 | CI | Two jobs on every push: `test` (ruff + pytest against Postgres 16) and `deploy` (build the image, run the Compose stack as on the laptop, check web + worker, restore a backup). See the CI section at the end |
 | Hosting | A dedicated laptop at home with Docker Compose, reachable only over Tailscale (section 12) |
 | AI | Qwen through OpenRouter (section 6.3); not needed until Phase 6 |
@@ -23,12 +24,17 @@ For the next agent picking up ParlayTracker. Read [SPEC.md](SPEC.md) first: it i
 | `parlaytracker/core/` | Models (0001, 0002), schemas, config, odds maths, settlement, services. `models.py` and `schemas.py` are canonical and identical to the SPEC.md code blocks |
 | `parlaytracker/core/services.py` | The only write path. Phase 1: `create_slip`, `find_duplicates`, `slip_warnings`. Phase 2: `upsert_event`, `settle_leg_manually`, `reopen_leg`, `refresh_slip`, `enter_slip_payout`, `mark_cashed_out`, `set_closing_line`, `review_queue`/`review_count`, tag and sportsbook management, and read helpers (`sportsbooks`, `all_tags`, `open_slips`, `recent_slips`, `event_ids_for`) |
 | `parlaytracker/ingest/http.py` | Shared httpx client (`ParlayTracker/1.0`, no cookies), `RateLimiter`, and `FetchError` with a `FailureKind` for every failure |
-| `parlaytracker/ingest/espn.py` | Scoreboard and roster parsers (Pydantic-validated, per-event errors), status mapping, US Eastern game days, and host failover (`site.web.api` → `site.api`). No breakers yet: those are Phase 3–4 |
+| `parlaytracker/ingest/espn.py` | Scoreboard and roster parsers (Pydantic-validated, per-event errors), status mapping, US Eastern game days, and host failover (`site.web.api` → `site.api`). Not yet routed through the breakers in `router.py`: that is Phase 4 |
 | `parlaytracker/app/` | Streamlit app: `main.py` (navigation, auth, health banner), `auth.py` (Tailscale guard), `common.py`, `components/slip_form.py`, `pages/log.py`, `review.py`, `settings.py` |
-| `parlaytracker/worker/__main__.py` | Phase 2 worker: advisory lock + heartbeat every 60 s. Phase 3 adds APScheduler and the jobs |
+| `parlaytracker/ingest/router.py` | `CircuitBreaker` (one per provider, section 8.3 rules) and `Breakers`, which writes every transition to `source_health` at once and the hourly counters at each heartbeat, and restores open breakers and the Odds API quota on restart. The ESPN failover router is Phase 4 |
+| `parlaytracker/ingest/odds_api.py` | Odds API client (`events`, `event_odds`) and Pydantic parsers. Reads `x-requests-remaining`/`x-requests-last`; feeds the breaker |
+| `parlaytracker/ingest/closing.py` | Pure closing-line selection: exact main, exact alternate, book's main line, median main (section 8.2 step 5), on parsed odds |
+| `parlaytracker/ingest/resolve.py` | Market and sport keys, team-name matching and rapidfuzz player matching (score >= 90, suffixes like Jr./III ignored). Sportsbook and market wording arrive with Phase 6 |
+| `parlaytracker/worker/` | `__main__.py`: advisory lock, `BlockingScheduler` (defaults `coalesce=True, max_instances=1, misfire_grace_time=30`). `jobs.py`: `heartbeat`, `guarded` (a job never raises into the scheduler) and `ClosingCapture` (the `capture_closing` job). Without `ODDS_API_KEY` only the heartbeat runs |
 | `Dockerfile`, `.dockerignore`, `.streamlit/config.toml` | One image for web, worker and migrations; the config hides Streamlit's developer menu |
 | `deploy/` | `docker-compose.yml`, `setup.sh`, `update.sh`, `backup.sh`, `restore.sh`, `status.sh`, `compose.sh`, `lib.sh`, `env.example`, systemd units, and `README.md` (the user's step-by-step guide) |
 | `tests/fixtures/espn/` | Real ESPN responses: NFL final, overtime and scheduled scoreboards; an MLB day with 2 postponements; NBA and NHL scoreboards; rosters for all four sports (NBA's is a flat list, the others are grouped); an Akamai 403 page |
+| `tests/live/` | Tests that call real services, run with `-m live`. Only the free Odds API events endpoint |
 | `tests/fixtures/odds_api/` | A real NFL events list and one event's odds for all 14 NFL market keys. They cost 14 credits: reuse them, don't re-fetch |
 
 ## Decisions made while building (not spelled out in SPEC.md)
@@ -44,7 +50,12 @@ For the next agent picking up ParlayTracker. Read [SPEC.md](SPEC.md) first: it i
 7. **Secrets:** `odds_api_key` and `qwen_api_key` are `SecretStr` (use `.get_secret_value()`), and `Settings` hides input values in its errors. That was added after a config error printed most of the Odds API key during testing (see "Needs the user").
 8. **Rate limits:** the web app waits up to 5 s for a slot (`common.WEB_MAX_WAIT`); the worker must pass `max_wait=0` and skip the request.
 9. **Ruff rules are E, F, W, B, UP**, without import sorting, to keep `models.py`/`schemas.py` identical to the spec blocks.
-10. **Dependencies:** each phase adds its own. Phase 3 needs `apscheduler<4`; later phases need `rapidfuzz`, `pandas`, `plotly`, `Pillow`, `openai` and `nflreadpy`.
+10. **`capture_closing` tries each game once per successful response**, tracked in memory (`ClosingCapture._attempted`). A leg the API has no line for isn't retried and paid for every minute until kickoff. A failed call (transient error, open breaker, rate limit) *is* retried on the next tick. A worker restart inside the 5-minute window can cost one repeat.
+11. **A missing closing line isn't a `needs_review` flag.** The Review queue already lists legs on games that started in the last 7 days with no closing line, and keeps them out of the nav badge (decision 5). The worker only logs why.
+12. **A 422 from the Odds API (for example an unknown market key) is `RequestRejected`, not a breaker failure.** Otherwise one unverified market (`player_points`) could open the breaker and block NFL captures.
+13. **Median closing odds are the median of implied probabilities**, converted back to American, because averaging American odds across the +100/-100 gap is meaningless. The median line is `median_low`, so it is always a real line.
+14. **httpx's loggers are set to WARNING** in `ingest/http.py`. httpx logs full request URLs at INFO, and the Odds API key is a query parameter: without this the worker's log would contain the key. `tests/unit/test_odds_api.py` checks it.
+15. **Dependencies:** each phase adds its own. Phase 3 added `apscheduler<4` and `rapidfuzz`; later phases need `pandas`, `plotly`, `Pillow`, `openai` and `nflreadpy`.
 
 ## Gotchas
 
@@ -85,6 +96,11 @@ export TEST_DATABASE_URL="$(.venv/bin/python scripts/dev_postgres.py)"
 - **The image's contents,** installed into a clean environment exactly as the `Dockerfile` copies them: migrations to head, web health OK, and the worker writing its heartbeat and stopping cleanly on SIGTERM. A second worker exits with "another worker already holds the lock".
 - **`docker compose config`:** only `web` is published, on `127.0.0.1:8501`; the database isn't exposed; migrations gate web and worker; a missing `POSTGRES_PASSWORD` is refused.
 
+## Checked by hand in Phase 3
+
+- **The real worker process** against the migrated test database: it starts with the heartbeat and closing-line jobs, writes a `source_health` row for all five providers, a second worker exits with code 1, and SIGTERM stops it cleanly (exit 0). The real API key appeared in its log 0 times.
+- **The live Odds API** (`pytest -m live`, the free events endpoint): the events list parses and the quota headers are read, at a cost of 0 credits. Nothing has yet called the paid odds endpoint through the client: that is covered only by the recorded fixture.
+
 ## Next steps
 
 **Phase 2, on the laptop (needs the user):**
@@ -101,10 +117,13 @@ export TEST_DATABASE_URL="$(.venv/bin/python scripts/dev_postgres.py)"
 
    Also confirm the Tailscale header on real Serve, and whether `site.api.espn.com` answers the home connection (section 15).
 
-**Phase 3 (can start now, in parallel):** closing lines (section 8.2):
-- APScheduler worker skeleton with the circuit breaker (8.3) and `source_health` writes;
-- Odds API client (use the saved fixtures);
-- `capture_closing` with the credit budget and reserve.
+**Phase 3, on a real game day (needs the laptop worker running with `ODDS_API_KEY` set):**
+1. Log some real slips (singles and an SGP, at least one at a book the API doesn't return, such as Caesars) for games starting soon.
+2. Check that every eligible leg got a closing line (`closing_source = 'odds_api'`) or shows in Review as "No closing line was captured".
+3. Compare the credits used (`source_health.quota_remaining` before and after) with the estimate: one credit per market in the first call, plus one per alternate market in a follow-up.
+4. Verify `player_points` and `player_points_alternate` on an NBA or NHL game (section 6.2). Until then a 422 is logged and the legs go to manual entry.
+
+**Phase 4 (can start now):** auto-settlement (section 13): ESPN summary parser, the ESPN router with host failover (it builds on `Breakers`), integrity guards, raw samples, and the `check_finals`, `settle`, `recheck_settled`, `canary` and `prune_samples` jobs. Add each job in `build_scheduler` with `guarded(...)`.
 
 ## Needs the user
 

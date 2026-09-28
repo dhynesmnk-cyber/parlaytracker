@@ -1,8 +1,10 @@
 """Shared HTTP client, rate limits and failure classification (SPEC.md sections 6.1 and 8.3)."""
+import logging
 import threading
 import time
 from bisect import insort
 from collections.abc import Callable
+from dataclasses import dataclass
 from http.cookiejar import CookieJar, DefaultCookiePolicy
 from typing import Any
 from urllib.parse import urlsplit
@@ -13,6 +15,10 @@ from parlaytracker.core.models import FailureKind
 
 USER_AGENT = "ParlayTracker/1.0"
 TIMEOUT = httpx.Timeout(10.0, connect=5.0)
+
+# httpx logs every request URL at INFO, and the Odds API takes its key as a query parameter.
+for _name in ("httpx", "httpcore"):
+    logging.getLogger(_name).setLevel(logging.WARNING)
 
 
 class RateLimited(Exception):
@@ -105,8 +111,15 @@ def _retry_after(response: httpx.Response) -> float | None:
         return None  # an HTTP date; the caller falls back to its default
 
 
-def get_json(url: str, params: dict[str, str] | None, limiter: RateLimiter,
-             max_wait: float = 0.0) -> Any:
+@dataclass(frozen=True)
+class JsonResponse:
+    data: Any
+    headers: httpx.Headers
+    text: str  # the raw body, kept so a parser failure can save it (section 8.3)
+
+
+def get_json_response(url: str, params: dict[str, str] | None, limiter: RateLimiter,
+                      max_wait: float = 0.0) -> JsonResponse:
     """GET a JSON document, classifying every failure as a FetchError (section 8.3).
 
     RateLimited propagates unchanged: it isn't a failure of the provider.
@@ -115,9 +128,10 @@ def get_json(url: str, params: dict[str, str] | None, limiter: RateLimiter,
     try:
         response = client().get(url, params=params)
     except httpx.TimeoutException as e:
-        raise FetchError(url, FailureKind.TRANSIENT, f"timeout: {e}") from e
+        raise FetchError(url, FailureKind.TRANSIENT, f"timeout: {type(e).__name__}") from e
     except httpx.TransportError as e:
-        raise FetchError(url, FailureKind.TRANSIENT, f"connection error: {e}") from e
+        raise FetchError(url, FailureKind.TRANSIENT,
+                         f"connection error: {type(e).__name__}") from e
 
     status = response.status_code
     retry_after = _retry_after(response)
@@ -127,9 +141,15 @@ def get_json(url: str, params: dict[str, str] | None, limiter: RateLimiter,
     if status == 429 or (retry_after is not None and status >= 400):
         raise FetchError(url, FailureKind.THROTTLED, f"HTTP {status}", status, retry_after)
     if status >= 400:
-        raise FetchError(url, FailureKind.TRANSIENT, f"HTTP {status}", status)
+        raise FetchError(url, FailureKind.TRANSIENT, f"HTTP {status}", status,
+                         body=response.text[:2000])
     try:
-        return response.json()
+        return JsonResponse(response.json(), response.headers, response.text)
     except ValueError as e:
         raise FetchError(url, FailureKind.TRANSIENT, "response is not valid JSON", status,
                          body=response.text[:2000]) from e
+
+
+def get_json(url: str, params: dict[str, str] | None, limiter: RateLimiter,
+             max_wait: float = 0.0) -> Any:
+    return get_json_response(url, params, limiter, max_wait).data
