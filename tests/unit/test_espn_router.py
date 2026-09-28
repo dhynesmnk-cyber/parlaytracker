@@ -276,3 +276,18 @@ def test_other_events_are_not_recorded(router, samples):
     route(WEB).mock(return_value=httpx.Response(200, json=SUMMARY))
     router.box_score(Sport.NFL, GAME)
     assert samples == []
+
+
+@respx.mock
+def test_a_scoreboard_showing_a_watched_event_is_recorded(samples):
+    watching = EspnRouter(Breakers(engine=None), RateLimiter(0, 1000), samples.append,
+                          record_event_ids={"401872958"})
+    respx.get(BOARD).mock(return_value=httpx.Response(
+        200, json=load("nfl_scoreboard_2026-09-27_final.json")))
+    watching.scoreboard(Sport.NFL, date(2026, 9, 27))
+    assert [(s.reason, s.source) for s in samples] == [("recording", "espn_web")]
+    samples.clear()
+    respx.get(BOARD).mock(return_value=httpx.Response(
+        200, json=load("nfl_scoreboard_2026-09-28_scheduled.json")))
+    watching.scoreboard(Sport.NFL, date(2026, 9, 28))  # a day without the event
+    assert samples == []

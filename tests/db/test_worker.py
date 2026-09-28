@@ -100,17 +100,33 @@ def test_a_failing_job_is_recorded_and_never_raises(engine, clean_health):
 def test_the_scheduler_registers_the_jobs_with_the_spec_defaults(engine):
     breakers = Breakers(engine)
     scheduler = build_scheduler(engine, breakers, OddsApiClient("k", breakers), reserve=50)
-    assert {j.id for j in scheduler.get_jobs()} == {"heartbeat", "capture_closing"}
+    assert {j.id for j in scheduler.get_jobs()} == {
+        "heartbeat", "capture_closing", "check_finals", "settle", "recheck_settled",
+        "verify_nfl", "canary", "canary_at_startup", "prune_samples"}
     # Jobs added before start() are pending; the defaults apply to each when it is scheduled.
     assert scheduler._job_defaults == {"coalesce": True, "max_instances": 1,
                                        "misfire_grace_time": 30}
-    for job in scheduler.get_jobs():
-        assert job.trigger.interval == timedelta(seconds=60)
+    every = {j.id: j.trigger.interval for j in scheduler.get_jobs()
+             if hasattr(j.trigger, "interval")}
+    assert every == {
+        "heartbeat": timedelta(seconds=60), "capture_closing": timedelta(seconds=60),
+        "check_finals": timedelta(minutes=15), "settle": timedelta(minutes=5),
+        "recheck_settled": timedelta(hours=1)}
+    daily = {j.id: str(j.trigger) for j in scheduler.get_jobs() if j.id not in every
+             and j.id != "canary_at_startup"}
+    assert daily == {
+        "verify_nfl": "cron[hour='10', minute='0']",
+        "canary": "cron[hour='9', minute='0']",
+        "prune_samples": "cron[hour='4', minute='0']"}
+    zones = {j.id: str(j.trigger.timezone) for j in scheduler.get_jobs() if j.id in daily}
+    assert zones == {"verify_nfl": "America/New_York", "canary": "America/New_York",
+                     "prune_samples": "UTC"}
 
 
-def test_without_an_odds_api_key_only_the_heartbeat_runs(engine):
+def test_without_an_odds_api_key_closing_lines_are_off_but_settlement_runs(engine):
     scheduler = build_scheduler(engine, Breakers(engine), None, reserve=50)
-    assert [j.id for j in scheduler.get_jobs()] == ["heartbeat"]
+    ids = {j.id for j in scheduler.get_jobs()}
+    assert "capture_closing" not in ids and {"heartbeat", "settle", "verify_nfl"} <= ids
 
 
 def test_only_one_worker_can_hold_the_lock(engine):

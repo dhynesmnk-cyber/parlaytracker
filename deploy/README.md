@@ -81,11 +81,13 @@ Then open the app and check your slips are all there.
 | Update history | `journalctl -u parlaytracker-update` |
 | Change a setting | Edit `/opt/parlaytracker/.env`, then `sudo /opt/parlaytracker/deploy/compose.sh up -d` |
 | Add a user | Invite them to the tailnet, add their login to `ALLOWED_LOGINS`, then `compose.sh up -d` |
+| Settle old games once (after the first install, or a long outage) | `compose.sh stop worker`, then `compose.sh run --rm worker python -m parlaytracker.cli backfill`, then `compose.sh start worker` |
+| Save a raw ESPN/Odds response as a test fixture | `compose.sh run --rm worker python -m parlaytracker.cli export-sample <id> /tmp/sample.json` |
 
 **If the laptop is off or offline during games:**
 - closing lines for those games are lost for good;
 - live tracking pauses;
-- results still settle once it's back.
+- results still settle once it's back (the worker asks ESPN for finished games every 15 minutes, and NFL results are also checked against nflverse each morning).
 
 The app shows a banner when the background worker has stopped.
 

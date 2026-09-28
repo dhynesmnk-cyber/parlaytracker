@@ -7,11 +7,12 @@ For the next agent picking up ParlayTracker. Read [SPEC.md](SPEC.md) first: it i
 | | |
 |---|---|
 | Code | All on `main`. Phases 0–2 were merged in [dhynesmnk-cyber/parlaytracker#4](https://github.com/dhynesmnk-cyber/parlaytracker/pull/4). Work on a branch, and open a PR into `main`: the laptop deploys whatever is merged there |
-| Done | Phases 0 and 1, and the **code** for Phases 2 and 3 (SPEC.md section 13). Phase 3 is on branch `claude/elegant-pasteur-0qqx5i`, not yet merged |
+| Done | Phases 0 and 1, and the **code** for Phases 2, 3 and 4 (SPEC.md section 13). Phases 3 and 4 are on branch `claude/elegant-pasteur-0qqx5i`, not yet merged |
 | Phase 2 still open | Its exit criteria need the real laptop: install it, log real slips from both phones over Tailscale, reboot, update, and restore a backup once (below) |
 | Phase 3 still open | Its exit criteria need a real game day with logged slips (below) |
-| Next after that | Phase 4: auto-settlement |
-| Tests | 1,111 passing locally on Python 3.12 + PostgreSQL 16 (unit, database and Streamlit app tests), plus 1 `live` test (`-m live`, 0 credits) |
+| Phase 4 still open | Its exit criteria need a real weekend of games (below) |
+| Next after that | Phase 5: analytics (then 6: screenshots, 7: live tracking) |
+| Tests | 1,281 passing locally on Python 3.12 + PostgreSQL 16 (unit, database and Streamlit app tests), plus 2 `live` tests (`-m live`, 0 credits) |
 | CI | Two jobs on every push: `test` (ruff + pytest against Postgres 16) and `deploy` (build the image, run the Compose stack as on the laptop, check web + worker, restore a backup). See the CI section at the end |
 | Hosting | A dedicated laptop at home with Docker Compose, reachable only over Tailscale (section 12) |
 | AI | Qwen through OpenRouter (section 6.3); not needed until Phase 6 |
@@ -24,17 +25,24 @@ For the next agent picking up ParlayTracker. Read [SPEC.md](SPEC.md) first: it i
 | `parlaytracker/core/` | Models (0001, 0002), schemas, config, odds maths, settlement, services. `models.py` and `schemas.py` are canonical and identical to the SPEC.md code blocks |
 | `parlaytracker/core/services.py` | The only write path. Phase 1: `create_slip`, `find_duplicates`, `slip_warnings`. Phase 2: `upsert_event`, `settle_leg_manually`, `reopen_leg`, `refresh_slip`, `enter_slip_payout`, `mark_cashed_out`, `set_closing_line`, `review_queue`/`review_count`, tag and sportsbook management, and read helpers (`sportsbooks`, `all_tags`, `open_slips`, `recent_slips`, `event_ids_for`) |
 | `parlaytracker/ingest/http.py` | Shared httpx client (`ParlayTracker/1.0`, no cookies), `RateLimiter`, and `FetchError` with a `FailureKind` for every failure |
-| `parlaytracker/ingest/espn.py` | Scoreboard and roster parsers (Pydantic-validated, per-event errors), status mapping, US Eastern game days, and host failover (`site.web.api` → `site.api`). Not yet routed through the breakers in `router.py`: that is Phase 4 |
+| `parlaytracker/ingest/espn.py` | Box-score parser (`parse_box_score`: summary and cdn documents, read by column key), scoreboard and roster parsers (Pydantic-validated, per-event errors), status mapping, US Eastern game days, and host failover (`site.web.api` → `site.api`). Not yet routed through the breakers in `router.py`: that is Phase 4 |
 | `parlaytracker/app/` | Streamlit app: `main.py` (navigation, auth, health banner), `auth.py` (Tailscale guard), `common.py`, `components/slip_form.py`, `pages/log.py`, `review.py`, `settings.py` |
-| `parlaytracker/ingest/router.py` | `CircuitBreaker` (one per provider, section 8.3 rules) and `Breakers`, which writes every transition to `source_health` at once and the hourly counters at each heartbeat, and restores open breakers and the Odds API quota on restart. The ESPN failover router is Phase 4 |
+| `parlaytracker/ingest/router.py` | `EspnRouter` (first provider whose breaker isn't open, falls through in the same run, classifies every failure, keeps raw samples, records watched events; the web app uses one too, with in-memory breakers), `CircuitBreaker` (one per provider, section 8.3 rules) and `Breakers`, which writes every transition to `source_health` at once and the hourly counters at each heartbeat, and restores open breakers and the Odds API quota on restart. The ESPN failover router is Phase 4 |
+| `parlaytracker/ingest/guards.py` | Pure integrity rules: progress key, stale / correction / advance, final never goes back to play, frozen-feed and probe rules, plausibility bounds. Frozen-feed *use* (the probe) is Phase 7 |
+| `parlaytracker/ingest/nflverse.py` | `NflverseData`: schedules, players, weekly stats and snap counts through `nflreadpy`, mapped only by ID, loaded once per job run, failures through the `nflverse` breaker |
 | `parlaytracker/ingest/odds_api.py` | Odds API client (`events`, `event_odds`) and Pydantic parsers. Reads `x-requests-remaining`/`x-requests-last`; feeds the breaker |
 | `parlaytracker/ingest/closing.py` | Pure closing-line selection: exact main, exact alternate, book's main line, median main (section 8.2 step 5), on parsed odds |
 | `parlaytracker/ingest/resolve.py` | Market and sport keys, team-name matching and rapidfuzz player matching (score >= 90, suffixes like Jr./III ignored). Sportsbook and market wording arrive with Phase 6 |
+| `parlaytracker/worker/settle.py` | `CheckFinals`, `Settle`, `RecheckSettled`, `VerifyNfl`, `Canary`, `prune_samples`, `sample_sink` (section 8.1, 7.1) |
+| `parlaytracker/cli.py` | `export-sample <id> <path>` and `backfill` (below) |
 | `parlaytracker/worker/` | `__main__.py`: advisory lock, `BlockingScheduler` (defaults `coalesce=True, max_instances=1, misfire_grace_time=30`). `jobs.py`: `heartbeat`, `guarded` (a job never raises into the scheduler) and `ClosingCapture` (the `capture_closing` job). Without `ODDS_API_KEY` only the heartbeat runs |
 | `Dockerfile`, `.dockerignore`, `.streamlit/config.toml` | One image for web, worker and migrations; the config hides Streamlit's developer menu |
 | `deploy/` | `docker-compose.yml`, `setup.sh`, `update.sh`, `backup.sh`, `restore.sh`, `status.sh`, `compose.sh`, `lib.sh`, `env.example`, systemd units, and `README.md` (the user's step-by-step guide) |
 | `tests/fixtures/espn/` | Real ESPN responses: NFL final, overtime and scheduled scoreboards; an MLB day with 2 postponements; NBA and NHL scoreboards; rosters for all four sports (NBA's is a flat list, the others are grouped); an Akamai 403 page |
-| `tests/live/` | Tests that call real services, run with `-m live`. Only the free Odds API events endpoint |
+| `tests/live/` | Tests that call real services, run with `-m live`, all free: the Odds API events endpoint, and the canary (every ESPN provider and nflverse) |
+| `tests/fixtures/espn/*summary*`, `nfl_cdn_game_*` | Real box scores (NFL, NFL overtime, NBA, NHL, NHL overtime, and the cdn wrapper), trimmed to the fields the parser reads |
+| `tests/fixtures/nflverse/week3_2026.json` | Slices of the four nflverse datasets for week 3 of 2026 (including a game with no scores yet) |
+| `tests/support.py` | Shared helpers for worker tests: committed data, `FakeRouter` (real parsers on fixtures), `nflverse_loader` |
 | `tests/fixtures/odds_api/` | A real NFL events list and one event's odds for all 14 NFL market keys. They cost 14 credits: reuse them, don't re-fetch |
 
 ## Decisions made while building (not spelled out in SPEC.md)
@@ -55,7 +63,16 @@ For the next agent picking up ParlayTracker. Read [SPEC.md](SPEC.md) first: it i
 12. **A 422 from the Odds API (for example an unknown market key) is `RequestRejected`, not a breaker failure.** Otherwise one unverified market (`player_points`) could open the breaker and block NFL captures.
 13. **Median closing odds are the median of implied probabilities**, converted back to American, because averaging American odds across the +100/-100 gap is meaningless. The median line is `median_low`, so it is always a real line.
 14. **httpx's loggers are set to WARNING** in `ingest/http.py`. httpx logs full request URLs at INFO, and the Odds API key is a query parameter: without this the worker's log would contain the key. `tests/unit/test_odds_api.py` checks it.
-15. **Dependencies:** each phase adds its own. Phase 3 added `apscheduler<4` and `rapidfuzz`; later phases need `pandas`, `plotly`, `Pillow`, `openai` and `nflreadpy`.
+16. **Settlement rules the worker follows** (SPEC.md 7.1, plus what the spec left open):
+    - `settle` calls the summary once per final event, even when only team legs are pending: the box score's final score is authoritative and also corrects the event, and it names the provider for `settlement_source`.
+    - `services.settle_leg_auto` enforces the 10-minute gate itself (constraint 2) and refuses to touch a settled leg. ESPN values need `final_at + 10 min`; nflverse values need kickoff + 4 h (its data is overnight, so there is no ESPN "final" to wait on).
+    - Legs already `needs_review` are left to a person; the worker never overwrites a flag's reason.
+    - "Played, no stat" is kept in `review_reason` with `needs_review` false: invisible in Review, queryable.
+    - A player with a nflverse row but a null stat counts as having no stat line.
+17. **`check_finals` also covers NFL until Phase 7** (the spec says NBA/NHL/MLB only). Without `poll_nfl_live` nothing else would ever mark an NFL game final. It starts 3 h after kickoff, every 15 min.
+18. **`apply_event_reading` compares a box score (no period or clock) as if the event hadn't moved**; otherwise a final box score would look older than the scoreboard's final and be discarded as stale.
+19. **Values in Review messages are normalised** (`fmt`): the database keeps `Numeric(8,1)`, so a stored 25 reads back as 25.0.
+20. **Dependencies:** each phase adds its own. Phase 3 added `apscheduler<4` and `rapidfuzz`, Phase 4 `nflreadpy` (which brings polars, pandas and pyarrow: the image is larger); later phases need `pandas`, `plotly`, `Pillow`, `openai` and `nflreadpy`.
 
 ## Gotchas
 
@@ -101,6 +118,12 @@ export TEST_DATABASE_URL="$(.venv/bin/python scripts/dev_postgres.py)"
 - **The real worker process** against the migrated test database: it starts with the heartbeat and closing-line jobs, writes a `source_health` row for all five providers, a second worker exits with code 1, and SIGTERM stops it cleanly (exit 0). The real API key appeared in its log 0 times.
 - **The live Odds API** (`pytest -m live`, the free events endpoint): the events list parses and the quota headers are read, at a cost of 0 credits. Nothing has yet called the paid odds endpoint through the client: that is covered only by the recorded fixture.
 
+## Checked by hand in Phase 4
+
+- **The real worker and the canary** (`pytest -m live`, and the worker's startup run): all three ESPN providers (`site.web.api`, `site.api` and `cdn.espn.com`) parsed a real completed NFL game, and nflverse loaded all four datasets. `site.api.espn.com` answered from this cloud environment on 2026-09-28, though the spec recorded it blocked the day before; the canary will tell you about the laptop's connection on first start.
+- **ESPN and nflverse agree on real data:** all 18 receiving lines in ARI @ SF match nflverse's weekly stats.
+- **Mutation checks:** breaking the disagreement comparison and the Tuesday deadline each made the intended tests fail.
+
 ## Next steps
 
 **Phase 2, on the laptop (needs the user):**
@@ -123,7 +146,14 @@ export TEST_DATABASE_URL="$(.venv/bin/python scripts/dev_postgres.py)"
 3. Compare the credits used (`source_health.quota_remaining` before and after) with the estimate: one credit per market in the first call, plus one per alternate market in a follow-up.
 4. Verify `player_points` and `player_points_alternate` on an NBA or NHL game (section 6.2). Until then a 422 is logged and the legs go to manual entry.
 
-**Phase 4 (can start now):** auto-settlement (section 13): ESPN summary parser, the ESPN router with host failover (it builds on `Breakers`), integrity guards, raw samples, and the `check_finals`, `settle`, `recheck_settled`, `canary` and `prune_samples` jobs. Add each job in `build_scheduler` with `guarded(...)`.
+**Phase 4, on a real weekend (needs the laptop worker running):**
+1. First run the one-off backfill for anything logged since Phase 2. Stop the worker (the CLI refuses to run beside it), run the backfill, then start the worker again: `compose.sh stop worker`, `compose.sh run --rm worker python -m parlaytracker.cli backfill`, `compose.sh start worker` (see `deploy/README.md`).
+2. Log real slips for a weekend of games, including player props. After the games, check every settled leg against what the sportsbook paid.
+3. Check every NFL leg from that weekend is either `verified_at` set (nflverse agreed) or has a Review item explaining why not. Legs settled from nflverse (ESPN had no line) stay unverified by design.
+4. Look at `source_health` and the banner for the breakers, and `raw_samples` for anything the parsers rejected. `python -m parlaytracker.cli export-sample <id> <path>` turns a sample into a fixture.
+5. Statuses still **to verify on a live game** (SPEC.md section 15): the halftime and delay names, and the live `period`/`clock` fields. That is Phase 7's recording.
+
+**Phase 5 (can start now):** analytics (section 10), built on seeded data first. `services` has no analytics yet; `core/analytics.py` is new.
 
 ## Needs the user
 
