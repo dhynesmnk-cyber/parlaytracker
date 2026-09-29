@@ -110,6 +110,11 @@ def read_slip(extractor, image_path: Path, save: Path | None) -> int:
     return 0
 
 
+def _read(path: Path) -> str:
+    """A file, or standard input for `-`: the laptop's containers can't see its files."""
+    return sys.stdin.read() if str(path) == "-" else path.read_text()
+
+
 def import_slips(engine: Engine, path: Path, user: str, apply: bool, include_doubtful: bool,
                  games_for=None, roster_for=None) -> int:
     """Plan the CSV's slips against ESPN and, with `apply`, write the ones that are sound."""
@@ -119,7 +124,7 @@ def import_slips(engine: Engine, path: Path, user: str, apply: bool, include_dou
     games_for = games_for or (lambda sport, day: espn.fetch_scoreboard(sport, day, wait).games)
     roster_for = roster_for or (lambda sport, team: espn.fetch_roster(sport, team, wait))
     try:
-        slips = slip_import.parse_csv(path.read_text())
+        slips = slip_import.parse_csv(_read(path))
     except (OSError, slip_import.CsvError) as e:
         print(f"can't read {path}: {e}", file=sys.stderr)
         return 1
@@ -143,7 +148,7 @@ def check_import(engine: Engine, path: Path) -> int:
     from parlaytracker.ingest import slip_import
 
     try:
-        slips = slip_import.parse_csv(path.read_text())
+        slips = slip_import.parse_csv(_read(path))
     except (OSError, slip_import.CsvError) as e:
         print(f"can't read {path}: {e}", file=sys.stderr)
         return 1

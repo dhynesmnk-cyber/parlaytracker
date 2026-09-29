@@ -14,7 +14,8 @@ For the next agent picking up ParlayTracker. Read [SPEC.md](SPEC.md) first: it i
 | Phase 6 still open | The code is done and tested against synthetic replies. The exit needs a `QWEN_API_KEY` and 10 real slips (below) |
 | Phase 7 still open | The code is done and simulated. The exit needs one real live game with a real recording (below) |
 | Next after that | All eight phases are built. What is left is real-world verification (Phases 2, 3, 4, 6, 7) |
-| Tests | 1,764 passing locally on Python 3.12 + PostgreSQL 16 (unit, database and Streamlit app tests), plus 2 `live` tests (`-m live`, 0 credits) |
+| Real data | 25 real Hard Rock slips (user 1, 2026-09-14 to 09-27) were imported and settled: all 77 legs and 25 slips match what the sportsbook said, and nflverse independently agreed on all 77 (see "Checked by hand with real slips"). The CSV is **not** in the repo (stakes and slip ids) |
+| Tests | 1,849 passing locally on Python 3.12 + PostgreSQL 16 (unit, database and Streamlit app tests), plus 2 `live` tests (`-m live`, 0 credits) |
 | CI | Two jobs on every push: `test` (ruff + pytest against Postgres 16) and `deploy` (build the image, run the Compose stack as on the laptop, check web + worker, restore a backup). See the CI section at the end |
 | Hosting | A dedicated laptop at home with Docker Compose, reachable only over Tailscale (section 12) |
 | AI | Qwen through OpenRouter (section 6.3). Without `QWEN_API_KEY` the Screenshot page says so and shows the ordinary form: nothing else depends on it |
@@ -24,7 +25,7 @@ For the next agent picking up ParlayTracker. Read [SPEC.md](SPEC.md) first: it i
 
 | Path | What it is |
 |---|---|
-| `parlaytracker/core/` | Models (0001, 0002), schemas, config, odds maths, settlement, services. `models.py` and `schemas.py` are canonical and identical to the SPEC.md code blocks |
+| `parlaytracker/core/` | Models (0001–0003), schemas, config, odds maths, settlement, services. `models.py` and `schemas.py` are canonical and identical to the SPEC.md code blocks |
 | `parlaytracker/core/services.py` | The only write path. Phase 1: `create_slip`, `find_duplicates`, `slip_warnings`. Phase 2: `upsert_event`, `settle_leg_manually`, `reopen_leg`, `refresh_slip`, `enter_slip_payout`, `mark_cashed_out`, `set_closing_line`, `review_queue`/`review_count`, tag and sportsbook management, and read helpers (`sportsbooks`, `all_tags`, `open_slips`, `recent_slips`, `event_ids_for`) |
 | `parlaytracker/ingest/http.py` | Shared httpx client (`ParlayTracker/1.0`, no cookies), `RateLimiter`, and `FetchError` with a `FailureKind` for every failure |
 | `parlaytracker/ingest/espn.py` | Box-score parser (`parse_box_score`: summary and cdn documents, read by column key), scoreboard and roster parsers (Pydantic-validated, per-event errors), status mapping, US Eastern game days, and host failover (`site.web.api` → `site.api`). Not yet routed through the breakers in `router.py`: that is Phase 4 |
@@ -37,6 +38,7 @@ For the next agent picking up ParlayTracker. Read [SPEC.md](SPEC.md) first: it i
 | `parlaytracker/ingest/odds_api.py` | Odds API client (`events`, `event_odds`) and Pydantic parsers. Reads `x-requests-remaining`/`x-requests-last`; feeds the breaker |
 | `parlaytracker/ingest/closing.py` | Pure closing-line selection: exact main, exact alternate, book's main line, median main (section 8.2 step 5), on parsed odds |
 | `parlaytracker/ingest/resolve.py` | Market and sport keys, team-name matching and rapidfuzz player matching (score >= 90, suffixes like Jr./III ignored). Phase 6 adds sportsbook, market, sport, team-alias, event and roster-player resolution for screenshots (`resolve_slip`) |
+| `parlaytracker/ingest/slip_import.py` | Loads slips transcribed into a CSV (`cli import-slips`, dry run unless `--apply`) and checks settled results against them (`cli check-import`). One row per leg; plans each slip against ESPN (game by matchup and start time, players by roster, printed wording cross-checked with `resolve_market` / `implied_line`), writes through `services.create_slip(placed_at=...)`, remembers a slip by `notes = "import <book> #<slip id>"` so a second run adds nothing |
 | `parlaytracker/worker/settle.py` | `CheckFinals`, `Settle`, `RecheckSettled`, `VerifyNfl`, `Canary`, `prune_samples`, `sample_sink` (section 8.1, 7.1) |
 | `parlaytracker/core/live.py` | The Live page's rules and read-model, pure and tested with exact numbers: which events are active (30 min before kickoff to 8 h after), the cadence table, a leg's live value and over/under state, freshness colours (amber after 2 min, red after 5 in play), "no change for N min", game status text, parlay progress, "ESPN unavailable since", and the verified / awaiting / unverified label |
 | `parlaytracker/worker/live.py` | `PollNflLive` (`poll_nfl_live`, every 30 s): only the requests due under the cadence table, one scoreboard call per game day, a box score per game with pending player legs, the integrity guards, `live_value` / `live_source` on pending legs through `services.set_live_value`, and the frozen-feed probe. Never settles anything |
@@ -107,6 +109,15 @@ For the next agent picking up ParlayTracker. Read [SPEC.md](SPEC.md) first: it i
     - **The health banner ignores a half-open provider** (open time passed, awaiting a trial). Fallbacks that were blocked aren't retried while the primary answers, so their rows would otherwise say "failing" until the next daily canary. A schema failure is still shown until a trial succeeds.
     - **Scoreboard recordings are tagged with the watched event** (they hold the whole day), so `export-recording` can pick a game out.
 26. **Dependencies:** each phase adds its own. Phase 3 added `apscheduler<4` and `rapidfuzz`, Phase 4 `nflreadpy` (which brings polars, pandas and pyarrow: the image is larger), Phase 6 `openai` (3.x: it ships its own HTTP library, `httpx2`) and `Pillow`, plus `pandas` declared explicitly (Phase 5 imported it without declaring it). `tests/unit/test_dependencies.py` fails if the application imports anything `pyproject.toml` doesn't declare: PR #7's first CI run failed because `openai` was installed locally but not declared, and it would have broken the Screenshot page in the image; later phases need `pandas`, `plotly`, `Pillow`, `openai` and `nflreadpy`.
+
+27. **Four more NFL player markets** (added 2026-09-29 after the first real slips: 15 of 77 legs were in them): `player_pass_completions`, `player_touchdowns`, `player_interceptions`, `player_field_goals` (migration 0003 swaps the `market_type` CHECK; SPEC.md updated with the models).
+    - **Touchdowns** = rushing + receiving + kick return + punt return + defensive TDs, never a passing one. "Anytime TD" is Over 0.5, "To score 2+ TDs" Over 1.5. ESPN: five tables added up (`STAT_COLUMNS` now holds several sources per market); nflverse: `rushing_tds + receiving_tds + special_teams_tds + def_tds`. A player in none of the tables is "missing", so the usual snaps rule settles him at 0. `interceptionTouchdowns` is left out on purpose (it may double-count `defensiveTouchdowns`); untested against a real defensive score.
+    - **Interceptions** are thrown ones (the `passing` table). **Completions** and **field goals** read the first number of ESPN's "38/52" and "3/3" columns.
+    - **No Odds API keys yet**, so `NO_AUTO_CLOSING` (`core/markets.py`) keeps these legs out of closing capture (a wrong key would get a whole request rejected) and out of the "no closing line" Review item; they can still be entered by hand. To turn them on: verify the keys on a real game (SPEC.md section 6.2 lists candidates), add them to `MARKET_KEYS`, shrink `NO_AUTO_CLOSING`.
+    - The screenshot resolver reads the wording Hard Rock prints ("ANYTIME TD", "TO SCORE 2+ TDS", "TO RECORD 65+ RUSHING YARDS"): `implied_line` turns a ladder into Over N - 0.5 and "anytime" into 0.5. Passing / first / last touchdown wording resolves to `other`.
+28. **Importing real slips** (`cli import-slips`, `cli check-import`): the CSV is the ground truth, so the importer only writes slips it can fully explain. A slip with an *error* (no such game, wrong kickoff time, player on neither roster, status disagreeing with its legs, unsupported bet type) is never written; one with a *doubt* (paid amount off by more than $1.00 from the odds, printed wording reading as another market, a fuzzy player match, placed after kickoff) needs `--include-doubtful`. Events are stored `scheduled` on purpose: saving a game that is already `final` would leave it with no `final_at` and it would never settle; the backfill finds it final and dates it. (The slip *form* has that same trap when a slip is logged after the game ended: `upsert_event(status=g.status)`. Not fixed; worth a look.)
+    - **Payouts:** a won slip's printed `paid` is stored as `potential_payout`, but `slips.payout` is computed from the rounded odds, so it differs by cents (4 wins: +0.14, +0.16, +0.04, -0.14). ROI is off by that much; not corrected.
+    - **The backfill now waits** for ESPN's request slots (`EspnRouter(default_max_wait=30)`) and **stops without settling or flagging anything** if any game is unreachable, because `Settle` would otherwise flag it "Not final 8 hours after its start". Before this, a 25-slip backfill flagged 43 legs for Review.
 
 ## Gotchas
 
@@ -179,7 +190,20 @@ export TEST_DATABASE_URL="$(.venv/bin/python scripts/dev_postgres.py)"
 - **Mutation-style findings while building:** a stuck 14-game slate cost 14 probes per interval (now one per day); the health banner kept calling a recovered fallback "failing" (now ignores half-open providers).
 - **Not done:** any real live game. The status names for halftime and delays (`STATUS_HALFTIME`, `STATUS_END_PERIOD`, delay wording) and the live `period`/`clock` fields are still the spec's expectations, not observed (SPEC.md section 15). The page was tested through `AppTest`, not in a browser on a phone during a game.
 
+## Checked by hand with real slips (2026-09-29)
+
+- **25 real Hard Rock slips** (user 1: 23 three-leg and 2 four-leg SGPs, 77 legs, stakes $970, 21 lost, 4 won) from 2026-09-14 to 09-27, transcribed to a CSV by the user. Every game, kickoff time and player matched against live ESPN data; the printed wording agreed with the market on every leg.
+- **Imported into a throwaway Postgres and settled by the real jobs** (`import-slips --apply`, `backfill`, `check-import`): 77 of 77 legs settled from ESPN, **all 77 verified by nflverse** (an independent source), and every leg and slip result matched what the sportsbook said. That includes the new markets (7 touchdown, 4 completion, 2 interception, 2 field goal legs).
+- **The Analytics page renders on it** (75 legs after dedupe: two selections appeared on two slips). Hit rate 49.3% (38-60%), sgp slips: staked 970.00, returned 873.20 computed (873.40 as paid), ROI -10.0%, "low sample". No CLV: past games have no closing lines.
+- **Mutation-checked:** dropping the kickoff-time check, the status-vs-legs check, the payout check, the placed-after-kickoff check, the `placed_at` write, the result comparison, the `scheduled` event status and the backfill stop each made a test fail.
+- **Not done:** the same on the laptop's real database (`import-slips` needs ESPN and a `--user` login; the CSV is on the user's side); the 25 screenshots were not read by Qwen (no key), so this says nothing about Qwen's accuracy; closing lines and CLV for these slips can't be recovered.
+
 ## Next steps
+
+**Loading real slips on the laptop (needs the CSV):**
+1. Copy the CSV to the laptop (not into the repo). `compose.sh run --rm worker python -m parlaytracker.cli import-slips /path/slips.csv --user <login>` is a dry run: read every ERROR and doubt. Then add `--apply` (and `--include-doubtful` for the ones you have checked).
+2. Stop the worker, `... cli backfill` (re-run it if it says games were unreachable), start the worker, then `... cli check-import /path/slips.csv`: it exits non-zero and names every leg or slip where our result differs from the sportsbook's.
+3. New slips: the same importer takes any CSV of this shape; other bet types (`single` is supported, `parlay` is not) need extending.
 
 **Phase 2, on the laptop (needs the user):**
 1. The user follows `deploy/README.md`:

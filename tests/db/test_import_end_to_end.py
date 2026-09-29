@@ -268,3 +268,12 @@ def test_backfill_stops_and_says_so_when_a_game_cannot_be_reached(engine, clean,
     with Session(engine) as s:
         legs = s.scalars(select(Slip)).one().legs
         assert all(leg.result is LegResult.PENDING and not leg.needs_review for leg in legs)
+
+
+def test_a_dash_reads_the_csv_from_standard_input(engine, clean, monkeypatch, capsys):
+    import io
+    from pathlib import Path
+
+    monkeypatch.setattr("sys.stdin", io.StringIO(csv_text(two_legs())))
+    assert cli.import_slips(engine, Path("-"), USER, False, False, games_for, roster_for) == 0
+    assert "OK        111" in capsys.readouterr().out
