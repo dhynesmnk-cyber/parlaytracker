@@ -1,7 +1,7 @@
 import pytest
 
-from parlaytracker.core.models import MarketType, Sport
-from parlaytracker.core.markets import MARKET_SPORTS
+from parlaytracker.core.models import Sport
+from parlaytracker.core.markets import MARKET_SPORTS, NO_AUTO_CLOSING
 from parlaytracker.ingest.resolve import (
     MARKET_KEYS,
     SPORT_KEYS,
@@ -14,7 +14,7 @@ from datetime import UTC, datetime, timedelta
 
 
 def test_every_analysed_market_and_sport_has_a_key():
-    assert set(MARKET_KEYS) == set(MARKET_SPORTS) - {MarketType.OTHER}
+    assert set(MARKET_KEYS) == set(MARKET_SPORTS) - NO_AUTO_CLOSING
     assert set(SPORT_KEYS) == set(Sport)
 
 

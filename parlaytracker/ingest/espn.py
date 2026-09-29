@@ -328,18 +328,33 @@ def fetch_roster(sport: Sport, team_id: str, max_wait: float = 0.0) -> list[Rost
 
 # --- Box scores (summary and cdn) ------------------------------------------------------------
 
-# (box-score group names, column keys summed) per player market. Keys, never positions or
-# labels (section 6.1). NHL has no points column: goals + assists. NBA's group has no name.
+# Per player market: one or more (box-score group names, column keys summed) sources, added
+# together for a player who appears in several. Keys, never positions or labels (section 6.1).
+# A column holding "made/attempted" ("38/52") is read as its first number. NHL has no points
+# column: goals + assists. NBA's group has no name.
 _NO_NAME = ""
-STAT_COLUMNS: dict[Sport, dict[MarketType, tuple[tuple[str, ...], tuple[str, ...]]]] = {
+Source = tuple[tuple[str, ...], tuple[str, ...]]
+STAT_COLUMNS: dict[Sport, dict[MarketType, tuple[Source, ...]]] = {
     Sport.NFL: {
-        MarketType.PLAYER_RECEPTIONS: (("receiving",), ("receptions",)),
-        MarketType.PLAYER_RECEIVING_YARDS: (("receiving",), ("receivingYards",)),
-        MarketType.PLAYER_RUSHING_YARDS: (("rushing",), ("rushingYards",)),
-        MarketType.PLAYER_PASSING_YARDS: (("passing",), ("passingYards",)),
+        MarketType.PLAYER_RECEPTIONS: ((("receiving",), ("receptions",)),),
+        MarketType.PLAYER_RECEIVING_YARDS: ((("receiving",), ("receivingYards",)),),
+        MarketType.PLAYER_RUSHING_YARDS: ((("rushing",), ("rushingYards",)),),
+        MarketType.PLAYER_PASSING_YARDS: ((("passing",), ("passingYards",)),),
+        MarketType.PLAYER_PASS_COMPLETIONS: ((("passing",), ("completions/passingAttempts",)),),
+        MarketType.PLAYER_INTERCEPTIONS: ((("passing",), ("interceptions",)),),
+        MarketType.PLAYER_FIELD_GOALS: ((("kicking",), ("fieldGoalsMade/fieldGoalAttempts",)),),
+        # Any touchdown except a passing one: rushing, receiving, both kinds of return, and a
+        # defensive touchdown. A player absent from every one of these table has none.
+        MarketType.PLAYER_TOUCHDOWNS: (
+            (("rushing",), ("rushingTouchdowns",)),
+            (("receiving",), ("receivingTouchdowns",)),
+            (("kickReturns",), ("kickReturnTouchdowns",)),
+            (("puntReturns",), ("puntReturnTouchdowns",)),
+            (("defensive",), ("defensiveTouchdowns",)),
+        ),
     },
-    Sport.NBA: {MarketType.PLAYER_POINTS: ((_NO_NAME,), ("points",))},
-    Sport.NHL: {MarketType.PLAYER_POINTS: (("forwards", "defenses"), ("goals", "assists"))},
+    Sport.NBA: {MarketType.PLAYER_POINTS: (((_NO_NAME,), ("points",)),)},
+    Sport.NHL: {MarketType.PLAYER_POINTS: ((("forwards", "defenses"), ("goals", "assists")),)},
     Sport.MLB: {},
 }
 
@@ -402,6 +417,7 @@ def unwrap_cdn(payload: Any) -> Any:
 
 
 def _stat_value(text: str) -> Decimal:
+    text = text.split("/")[0] if "/" in text else text  # "38/52": the first number
     try:
         value = Decimal(text)
     except InvalidOperation as e:
@@ -434,19 +450,21 @@ def parse_box_score(sport: Sport, payload: Any) -> BoxScore:
         did_not_play: set[str] = set()
         for team in doc.boxscore.players:
             for group in team.statistics:
-                for market, (groups, columns) in STAT_COLUMNS[sport].items():
-                    if (group.name or _NO_NAME) not in groups:
-                        continue
-                    idx = [group.keys.index(c) for c in columns]  # ValueError if a key is gone
-                    for a in group.athletes:
-                        if a.didNotPlay:
-                            did_not_play.add(a.athlete.id)
-                        elif a.stats:
-                            if len(a.stats) != len(group.keys):
-                                raise ValueError(f"athlete {a.athlete.id} has {len(a.stats)} "
-                                                 f"stats for {len(group.keys)} keys")
-                            stats[market][a.athlete.id] = sum(
-                                (_stat_value(a.stats[i]) for i in idx), Decimal(0))
+                for market, sources in STAT_COLUMNS[sport].items():
+                    for groups, columns in sources:
+                        if (group.name or _NO_NAME) not in groups:
+                            continue
+                        idx = [group.keys.index(c) for c in columns]  # ValueError if one is gone
+                        for a in group.athletes:
+                            if a.didNotPlay:
+                                did_not_play.add(a.athlete.id)
+                            elif a.stats:
+                                if len(a.stats) != len(group.keys):
+                                    raise ValueError(f"athlete {a.athlete.id} has {len(a.stats)}"
+                                                     f" stats for {len(group.keys)} keys")
+                                value = sum((_stat_value(a.stats[i]) for i in idx), Decimal(0))
+                                stats[market][a.athlete.id] = (
+                                    stats[market].get(a.athlete.id, Decimal(0)) + value)
         return BoxScore(
             espn_event_id=header.id,
             status=map_status(comp.status.type.name, state, comp.status.type.completed),

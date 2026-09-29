@@ -27,6 +27,10 @@ MARKET_LABELS = {
     MarketType.PLAYER_RECEIVING_YARDS: "Receiving yards",
     MarketType.PLAYER_RUSHING_YARDS: "Rushing yards",
     MarketType.PLAYER_PASSING_YARDS: "Passing yards",
+    MarketType.PLAYER_PASS_COMPLETIONS: "Pass completions",
+    MarketType.PLAYER_TOUCHDOWNS: "Touchdowns",
+    MarketType.PLAYER_INTERCEPTIONS: "Interceptions thrown",
+    MarketType.PLAYER_FIELD_GOALS: "Field goals made",
     MarketType.PLAYER_POINTS: "Points",
     MarketType.OTHER: "Other (settled by hand)",
 }

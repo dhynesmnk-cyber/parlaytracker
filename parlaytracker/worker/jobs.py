@@ -12,6 +12,7 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session, joinedload, selectinload
 
 from parlaytracker.core import services
+from parlaytracker.core.markets import NO_AUTO_CLOSING
 from parlaytracker.core.models import (
     ClosingSource,
     Event,
@@ -19,7 +20,6 @@ from parlaytracker.core.models import (
     HealthState,
     Leg,
     LegResult,
-    MarketType,
     RawSample,
     Slip,
     SourceHealth,
@@ -111,7 +111,7 @@ class ClosingCapture:
         with Session(self._engine, expire_on_commit=False) as session:
             legs = session.scalars(
                 select(Leg).join(Leg.event)
-                .where(Leg.result == LegResult.PENDING, Leg.market_type != MarketType.OTHER,
+                .where(Leg.result == LegResult.PENDING, Leg.market_type.notin_(NO_AUTO_CLOSING),
                        Leg.closing_captured_at.is_(None),
                        Event.start_time > now, Event.start_time <= now + CAPTURE_WINDOW)
                 .options(joinedload(Leg.event),

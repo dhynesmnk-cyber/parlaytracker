@@ -35,6 +35,10 @@ class MarketType(enum.StrEnum):
     PLAYER_RECEIVING_YARDS = "player_receiving_yards"
     PLAYER_RUSHING_YARDS = "player_rushing_yards"
     PLAYER_PASSING_YARDS = "player_passing_yards"
+    PLAYER_PASS_COMPLETIONS = "player_pass_completions"
+    PLAYER_TOUCHDOWNS = "player_touchdowns"  # rushing + receiving + returns, never passing
+    PLAYER_INTERCEPTIONS = "player_interceptions"  # thrown by a quarterback
+    PLAYER_FIELD_GOALS = "player_field_goals"  # made
     PLAYER_POINTS = "player_points"
     OTHER = "other"  # out-of-scope parlay leg (Under, moneyline): manual settle, not analysed
 

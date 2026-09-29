@@ -137,3 +137,41 @@ def test_null_and_nan_stats_count_as_missing(breakers):
 
     data = NflverseData(breakers, nflverse_loader(blank))
     assert data.stat_value(SEASON, ARI_SF, MCBRIDE, M.PLAYER_RECEPTIONS) is None
+
+
+def _set(columns: dict):
+    """A patch that sets columns on Brissett's stat row only (None stays None)."""
+    def patch(frames):
+        stats = frames["player_stats"]
+        me = stats.filter(pl.col("player_display_name") == "Jacoby Brissett")["player_id"][0]
+        frames["player_stats"] = stats.with_columns([
+            pl.when(pl.col("player_id") == me).then(pl.lit(v, dtype=pl.Float64)).otherwise(
+                pl.col(c).cast(pl.Float64)).alias(c) for c, v in columns.items()])
+    return patch
+
+
+@pytest.mark.parametrize(("market", "column", "value"), [
+    (M.PLAYER_PASS_COMPLETIONS, "completions", 38),
+    (M.PLAYER_INTERCEPTIONS, "passing_interceptions", 2),
+    (M.PLAYER_FIELD_GOALS, "fg_made", 3),
+])
+def test_the_new_single_column_markets_read_their_own_column(breakers, market, column, value):
+    data = NflverseData(breakers, nflverse_loader(_set({column: value})))
+    assert data.stat_value(SEASON, ARI_SF, BRISSETT, market) == value
+
+
+def test_touchdowns_add_rushing_receiving_returns_and_defence(breakers):
+    patch = _set({"rushing_tds": 1, "receiving_tds": 2, "special_teams_tds": 1, "def_tds": 1})
+    data = NflverseData(breakers, nflverse_loader(patch))
+    assert data.stat_value(SEASON, ARI_SF, BRISSETT, M.PLAYER_TOUCHDOWNS) == 5
+
+
+def test_a_touchdown_column_left_empty_counts_as_zero_but_all_empty_is_no_stat_line(breakers):
+    partial = _set({"rushing_tds": 1, "receiving_tds": float("nan"), "special_teams_tds": None,
+                    "def_tds": None})
+    data = NflverseData(breakers, nflverse_loader(partial))
+    assert data.stat_value(SEASON, ARI_SF, BRISSETT, M.PLAYER_TOUCHDOWNS) == 1
+    empty = _set({c: None for c in ("rushing_tds", "receiving_tds", "special_teams_tds",
+                                    "def_tds")})
+    data = NflverseData(breakers, nflverse_loader(empty))
+    assert data.stat_value(SEASON, ARI_SF, BRISSETT, M.PLAYER_TOUCHDOWNS) is None

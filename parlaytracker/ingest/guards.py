@@ -90,6 +90,10 @@ _BOUNDS: dict[MarketType, tuple[int, int]] = {
     MarketType.PLAYER_RUSHING_YARDS: (-30, 400),
     MarketType.PLAYER_PASSING_YARDS: (-30, 700),
     MarketType.PLAYER_RECEPTIONS: (0, 25),
+    MarketType.PLAYER_PASS_COMPLETIONS: (0, 70),
+    MarketType.PLAYER_TOUCHDOWNS: (0, 8),
+    MarketType.PLAYER_INTERCEPTIONS: (0, 10),
+    MarketType.PLAYER_FIELD_GOALS: (0, 10),
 }
 
 

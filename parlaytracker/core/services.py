@@ -11,7 +11,7 @@ from decimal import Decimal
 from sqlalchemy import and_, func, select
 from sqlalchemy.orm import Session, selectinload
 
-from parlaytracker.core.markets import MARKET_SPORTS
+from parlaytracker.core.markets import MARKET_SPORTS, NO_AUTO_CLOSING
 from parlaytracker.core.models import (
     ClosingSource,
     DataSource,
@@ -481,7 +481,7 @@ def review_queue(session: Session, now: datetime | None = None) -> list[ReviewIt
     awaiting = and_(Leg.result == LegResult.PENDING,
                     Event.start_time <= now - AWAITING_RESULT_AFTER)
     no_closing = and_(
-        Leg.closing_captured_at.is_(None), Leg.market_type != MarketType.OTHER,
+        Leg.closing_captured_at.is_(None), Leg.market_type.notin_(NO_AUTO_CLOSING),
         Event.start_time <= now, Event.start_time > now - CLOSING_LINE_WINDOW,
     )
     legs = session.scalars(
@@ -506,7 +506,7 @@ def review_queue(session: Session, now: datetime | None = None) -> list[ReviewIt
         ReviewItem("closing_line", "No closing line was captured: enter it if you can",
                    leg.slip, leg)
         for leg in legs
-        if leg.closing_captured_at is None and leg.market_type is not MarketType.OTHER
+        if leg.closing_captured_at is None and leg.market_type not in NO_AUTO_CLOSING
         and now - CLOSING_LINE_WINDOW < leg.event.start_time <= now
     ]
     return items

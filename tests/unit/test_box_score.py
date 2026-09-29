@@ -145,3 +145,45 @@ def test_columns_reordered_still_parse_correctly():
     box = espn.parse_box_score(Sport.NFL, payload)
     assert value(box, payload, M.PLAYER_RECEPTIONS, "Trey McBride") == 9
     assert value(box, payload, M.PLAYER_RECEIVING_YARDS, "Trey McBride") == 75
+
+
+# --- Completions, touchdowns, interceptions, field goals (read off the same recorded game) ----
+
+
+def test_completions_are_the_first_number_of_a_made_over_attempted_column(nfl, nfl_payload):
+    assert value(nfl, nfl_payload, M.PLAYER_PASS_COMPLETIONS, "Jacoby Brissett") == 38  # 38/52
+    assert value(nfl, nfl_payload, M.PLAYER_PASS_COMPLETIONS, "Brock Purdy") == 15      # 15/27
+
+
+def test_interceptions_are_the_ones_a_passer_threw(nfl, nfl_payload):
+    assert value(nfl, nfl_payload, M.PLAYER_INTERCEPTIONS, "Jacoby Brissett") == 0
+    # Someone in the defensive "interceptions" table is not a passer: no value.
+    assert value(nfl, nfl_payload, M.PLAYER_INTERCEPTIONS, "Christian McCaffrey") is None
+
+
+def test_field_goals_made_are_the_first_number_of_made_over_attempted(nfl, nfl_payload):
+    assert value(nfl, nfl_payload, M.PLAYER_FIELD_GOALS, "Chad Ryland") == 3    # 3/3
+    assert value(nfl, nfl_payload, M.PLAYER_FIELD_GOALS, "Eddy Pineiro") == 1   # 1/1
+
+
+def test_touchdowns_add_up_across_tables_and_leave_passing_ones_out(nfl, nfl_payload):
+    tds = lambda who: value(nfl, nfl_payload, M.PLAYER_TOUCHDOWNS, who)  # noqa: E731
+    assert tds("George Kittle") == 2            # receiving 2
+    assert tds("Christian McCaffrey") == 1      # rushing 1 + receiving 0
+    assert tds("Deebo Samuel Sr.") == 1         # rushing 0 + receiving 1 + kick return 0
+    assert tds("Jacoby Brissett") == 1          # a rushing TD; he threw 2 more, which don't count
+    assert tds("Tyler Allgeier") == 0           # listed, no touchdowns: a real zero
+
+
+def test_a_player_in_no_touchdown_table_has_no_value(nfl, nfl_payload):
+    assert value(nfl, nfl_payload, M.PLAYER_TOUCHDOWNS, "Chad Ryland") is None
+
+
+def test_a_missing_field_goal_column_is_a_schema_error(nfl_payload):
+    broken = copy.deepcopy(nfl_payload)
+    for team in broken["boxscore"]["players"]:
+        for group in team["statistics"]:
+            if group["name"] == "kicking":
+                group["keys"][0] = "fieldGoalsRenamed"
+    with pytest.raises(espn.SchemaError):
+        espn.parse_box_score(Sport.NFL, broken)
