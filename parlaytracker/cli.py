@@ -3,13 +3,16 @@
     export-sample <id> <path>   write a saved raw response out as a test fixture
     backfill                    settle everything logged before the worker could (Phase 4)
     read-slip <image> [--save]  read a slip screenshot with Qwen; --save keeps the raw reply
+    export-recording <event> <dir>  write a recorded game (RECORD_EVENT_IDS) out for replay
 """
 import argparse
+import json
 import logging
 import sys
 from pathlib import Path
 
 from sqlalchemy import Engine
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from parlaytracker.core.db import make_engine
@@ -51,6 +54,31 @@ def backfill(engine: Engine, router: EspnRouter, nflverse) -> int:
     return 0
 
 
+def export_recording(engine: Engine, espn_event_id: str, directory: Path) -> int:
+    """Write every recording of one game, in the order it was saved, as `NNNN_source_kind.json`
+    plus an `index.json`: a real game to replay through `poll_nfl_live` (section 11)."""
+    with Session(engine) as session:
+        samples = session.scalars(
+            select(RawSample).where(RawSample.reason == "recording",
+                                    RawSample.espn_event_id == espn_event_id)
+            .order_by(RawSample.id)).all()
+        if not samples:
+            print(f"no recordings for event {espn_event_id}: set RECORD_EVENT_IDS before the "
+                  "game and restart the worker", file=sys.stderr)
+            return 1
+        directory.mkdir(parents=True, exist_ok=True)
+        index = []
+        for n, sample in enumerate(samples, start=1):
+            kind = "scoreboard" if sample.url.rstrip("/").endswith("scoreboard") else "summary"
+            name = f"{n:04d}_{sample.source}_{kind}.json"
+            (directory / name).write_text(sample.body)
+            index.append({"file": name, "source": sample.source, "kind": kind,
+                          "url": sample.url, "fetched_at": sample.fetched_at.isoformat()})
+        (directory / "index.json").write_text(json.dumps(index, indent=2))
+        print(f"wrote {len(samples)} responses to {directory}")
+    return 0
+
+
 def read_slip(extractor, image_path: Path, save: Path | None) -> int:
     """Read one screenshot exactly as the Screenshot page does and show what came back.
 
@@ -81,6 +109,9 @@ def main(argv: list[str] | None = None) -> int:
     export.add_argument("id", type=int, help="raw_samples.id")
     export.add_argument("path", type=Path)
     commands.add_parser("backfill", help="settle everything logged since Phase 2")
+    recording = commands.add_parser("export-recording", help="write a recorded game out")
+    recording.add_argument("event", help="ESPN event id")
+    recording.add_argument("directory", type=Path)
     read = commands.add_parser("read-slip", help="read a slip screenshot with Qwen")
     read.add_argument("image", type=Path)
     read.add_argument("--save", type=Path, help="write the raw model reply to this file")
@@ -99,6 +130,8 @@ def main(argv: list[str] | None = None) -> int:
     engine = make_engine()
     if args.command == "export-sample":
         return export_sample(engine, args.id, args.path)
+    if args.command == "export-recording":
+        return export_recording(engine, args.event, args.directory)
 
     lock_conn = engine.connect()  # the worker's lock: two writers would poll ESPN twice
     if not try_lock(lock_conn):

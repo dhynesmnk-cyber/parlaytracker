@@ -2,18 +2,19 @@
 
 For the next agent picking up ParlayTracker. Read [SPEC.md](SPEC.md) first: it is the design and the build plan. This file says where the build stands and what to do next.
 
-## Where things stand (2026-09-28)
+## Where things stand (2026-09-29)
 
 | | |
 |---|---|
 | Code | All on `main`. Phases 0–2 were merged in [dhynesmnk-cyber/parlaytracker#4](https://github.com/dhynesmnk-cyber/parlaytracker/pull/4), Phases 3–5 in [dhynesmnk-cyber/parlaytracker#6](https://github.com/dhynesmnk-cyber/parlaytracker/pull/6). Work on a branch, and open a PR into `main`: the laptop deploys whatever is merged there |
-| Done | Phases 0, 1 and 5 (SPEC.md section 13), and the **code** for Phases 2, 3, 4 and 6 |
+| Done | Phases 0, 1 and 5 (SPEC.md section 13), and the **code** for Phases 2, 3, 4, 6 and 7 |
 | Phase 2 still open | Its exit criteria need the real laptop: install it, log real slips from both phones over Tailscale, reboot, update, and restore a backup once (below) |
 | Phase 3 still open | Its exit criteria need a real game day with logged slips (below) |
 | Phase 4 still open | Its exit criteria need a real weekend of games (below) |
 | Phase 6 still open | The code is done and tested against synthetic replies. The exit needs a `QWEN_API_KEY` and 10 real slips (below) |
-| Next after that | Phase 7: live tracking |
-| Tests | 1,590 passing locally on Python 3.12 + PostgreSQL 16 (unit, database and Streamlit app tests), plus 2 `live` tests (`-m live`, 0 credits) |
+| Phase 7 still open | The code is done and simulated. The exit needs one real live game with a real recording (below) |
+| Next after that | All eight phases are built. What is left is real-world verification (Phases 2, 3, 4, 6, 7) |
+| Tests | 1,764 passing locally on Python 3.12 + PostgreSQL 16 (unit, database and Streamlit app tests), plus 2 `live` tests (`-m live`, 0 credits) |
 | CI | Two jobs on every push: `test` (ruff + pytest against Postgres 16) and `deploy` (build the image, run the Compose stack as on the laptop, check web + worker, restore a backup). See the CI section at the end |
 | Hosting | A dedicated laptop at home with Docker Compose, reachable only over Tailscale (section 12) |
 | AI | Qwen through OpenRouter (section 6.3). Without `QWEN_API_KEY` the Screenshot page says so and shows the ordinary form: nothing else depends on it |
@@ -31,13 +32,16 @@ For the next agent picking up ParlayTracker. Read [SPEC.md](SPEC.md) first: it i
 | `parlaytracker/ingest/extraction.py` | Screenshot reading (section 6.3, 9.6): `prepare_image` (png/jpg/webp by magic bytes, 8 MB, longest side 2000 px, EXIF upright, pixel guard), `Extractor` (one OpenAI-SDK call to OpenRouter, `temperature=0`, 45 s, `json_schema`), and `parse_reply` (forgiving: code fences, Unicode minus, string numbers, a bad field is dropped and the rest kept). Never logs or raises the key, the image or the raw reply |
 | `parlaytracker/app/` | Streamlit app: `main.py` (navigation, auth, health banner), `pages/screenshot.py` (upload, read, then the same form pre-filled), `pages/analytics.py`, `auth.py` (Tailscale guard), `common.py`, `components/slip_form.py`, `pages/log.py`, `review.py`, `settings.py` |
 | `parlaytracker/ingest/router.py` | `EspnRouter` (first provider whose breaker isn't open, falls through in the same run, classifies every failure, keeps raw samples, records watched events; the web app uses one too, with in-memory breakers), `CircuitBreaker` (one per provider, section 8.3 rules) and `Breakers`, which writes every transition to `source_health` at once and the hourly counters at each heartbeat, and restores open breakers and the Odds API quota on restart. The ESPN failover router is Phase 4 |
-| `parlaytracker/ingest/guards.py` | Pure integrity rules: progress key, stale / correction / advance, final never goes back to play, frozen-feed and probe rules, plausibility bounds. Frozen-feed *use* (the probe) is Phase 7 |
+| `parlaytracker/ingest/guards.py` | Pure integrity rules: progress key, stale / correction / advance, final never goes back to play, frozen-feed and probe rules, plausibility bounds. The frozen-feed *use* (the probe) is in `worker/live.py` |
 | `parlaytracker/ingest/nflverse.py` | `NflverseData`: schedules, players, weekly stats and snap counts through `nflreadpy`, mapped only by ID, loaded once per job run, failures through the `nflverse` breaker |
 | `parlaytracker/ingest/odds_api.py` | Odds API client (`events`, `event_odds`) and Pydantic parsers. Reads `x-requests-remaining`/`x-requests-last`; feeds the breaker |
 | `parlaytracker/ingest/closing.py` | Pure closing-line selection: exact main, exact alternate, book's main line, median main (section 8.2 step 5), on parsed odds |
 | `parlaytracker/ingest/resolve.py` | Market and sport keys, team-name matching and rapidfuzz player matching (score >= 90, suffixes like Jr./III ignored). Phase 6 adds sportsbook, market, sport, team-alias, event and roster-player resolution for screenshots (`resolve_slip`) |
 | `parlaytracker/worker/settle.py` | `CheckFinals`, `Settle`, `RecheckSettled`, `VerifyNfl`, `Canary`, `prune_samples`, `sample_sink` (section 8.1, 7.1) |
-| `parlaytracker/cli.py` | `export-sample <id> <path>`, `backfill` (below) and `read-slip <image> [--save path]` (reads a screenshot as the page does; `--save` keeps the raw reply as a fixture) |
+| `parlaytracker/core/live.py` | The Live page's rules and read-model, pure and tested with exact numbers: which events are active (30 min before kickoff to 8 h after), the cadence table, a leg's live value and over/under state, freshness colours (amber after 2 min, red after 5 in play), "no change for N min", game status text, parlay progress, "ESPN unavailable since", and the verified / awaiting / unverified label |
+| `parlaytracker/worker/live.py` | `PollNflLive` (`poll_nfl_live`, every 30 s): only the requests due under the cadence table, one scoreboard call per game day, a box score per game with pending player legs, the integrity guards, `live_value` / `live_source` on pending legs through `services.set_live_value`, and the frozen-feed probe. Never settles anything |
+| `parlaytracker/app/pages/live.py` | The Live page: cards for pending slips with an active NFL game, in an `st.fragment(run_every=15)`, then "Settled in the last 7 days" |
+| `parlaytracker/cli.py` | `export-recording <event> <dir>` (a recorded game, in order, with an index, for replay), `export-sample <id> <path>`, `backfill` (below) and `read-slip <image> [--save path]` (reads a screenshot as the page does; `--save` keeps the raw reply as a fixture) |
 | `parlaytracker/worker/` | `__main__.py`: advisory lock, `BlockingScheduler` (defaults `coalesce=True, max_instances=1, misfire_grace_time=30`). `jobs.py`: `heartbeat`, `guarded` (a job never raises into the scheduler) and `ClosingCapture` (the `capture_closing` job). Without `ODDS_API_KEY` only the heartbeat runs |
 | `Dockerfile`, `.dockerignore`, `.streamlit/config.toml` | One image for web, worker and migrations; the config hides Streamlit's developer menu |
 | `deploy/` | `docker-compose.yml`, `setup.sh`, `update.sh`, `backup.sh`, `restore.sh`, `status.sh`, `compose.sh`, `lib.sh`, `env.example`, systemd units, and `README.md` (the user's step-by-step guide) |
@@ -93,7 +97,16 @@ For the next agent picking up ParlayTracker. Read [SPEC.md](SPEC.md) first: it i
     - A stake on the slip pre-ticks "I placed this bet" (a screenshot of a bet with a stake is usually placed): check it.
     - Each image is read **once** (sha256 in session state), not on every rerun; after Save the uploader and form start fresh.
     - **The SDK ships its own HTTP library** (`httpx2`), so `respx` can't intercept it. Tests give the real client a mock transport and assert the mock was reached; `tests/unit/test_extraction.py` verifies the actual wire request (URL, bearer header, body, 45 s timeout).
-24. **Dependencies:** each phase adds its own. Phase 3 added `apscheduler<4` and `rapidfuzz`, Phase 4 `nflreadpy` (which brings polars, pandas and pyarrow: the image is larger), Phase 6 `openai` (3.x: it ships its own HTTP library, `httpx2`) and `Pillow`, plus `pandas` declared explicitly (Phase 5 imported it without declaring it). `tests/unit/test_dependencies.py` fails if the application imports anything `pyproject.toml` doesn't declare: PR #7's first CI run failed because `openai` was installed locally but not declared, and it would have broken the Screenshot page in the image; later phases need `pandas`, `plotly`, `Pillow`, `openai` and `nflreadpy`.
+25. **Live tracking** (SPEC.md 8.1, 8.3 and 9.4, plus what the spec left open):
+    - **Live values are display only.** `services.set_live_value` refuses a settled leg and never touches `result`; the tests check that a total already far past its line stays pending. Settlement still needs `final_at + 10 min` from the box score.
+    - **A player missing from the live box score shows "no stat line yet", never 0** (section 6.1: absence means neither zero nor void). Team legs take their live value from the scoreboard's score.
+    - **The frozen-feed probe is one request per game day every 5 minutes**, not one per game. It returns the whole day, and a stuck 14-game slate would otherwise cost 14 identical requests per interval. If any frozen game is *ahead* on the other provider, that provider's breaker opens as `frozen` (5 min) and the fresher data is applied to every game that day. A probe that finds the same key means the game is stopped (a review, an injury): nothing changes, and no provider switch. Halftime and delays are never "frozen".
+    - **Requests in one tick are spaced 2.1 s apart** inside the job (a pause, not a wait in the rate limiter), so a busy Sunday isn't refused by the 1-per-2-s-per-host limit. A 14-game slate with props in 5 games measures about 7 requests a minute.
+    - **A parlay with a lost leg has lost** (section 7.2), so it is no longer pending and has no live card: it appears under "Settled". "N lost" in the progress line exists in the code and its tests but can't show on a card for that reason.
+    - **Break and delay freshness limits are 4 and 7 minutes** (the spec gives 2 and 5 for a game in play only): those states are polled every 2 minutes, so 2 and 5 would always be amber.
+    - **The health banner ignores a half-open provider** (open time passed, awaiting a trial). Fallbacks that were blocked aren't retried while the primary answers, so their rows would otherwise say "failing" until the next daily canary. A schema failure is still shown until a trial succeeds.
+    - **Scoreboard recordings are tagged with the watched event** (they hold the whole day), so `export-recording` can pick a game out.
+26. **Dependencies:** each phase adds its own. Phase 3 added `apscheduler<4` and `rapidfuzz`, Phase 4 `nflreadpy` (which brings polars, pandas and pyarrow: the image is larger), Phase 6 `openai` (3.x: it ships its own HTTP library, `httpx2`) and `Pillow`, plus `pandas` declared explicitly (Phase 5 imported it without declaring it). `tests/unit/test_dependencies.py` fails if the application imports anything `pyproject.toml` doesn't declare: PR #7's first CI run failed because `openai` was installed locally but not declared, and it would have broken the Screenshot page in the image; later phases need `pandas`, `plotly`, `Pillow`, `openai` and `nflreadpy`.
 
 ## Gotchas
 
@@ -159,6 +172,13 @@ export TEST_DATABASE_URL="$(.venv/bin/python scripts/dev_postgres.py)"
 - **Mutation checks:** dropping the player default, reading on every rerun, dropping the doubt marks, and saving as `quick_add` each made the intended tests fail; breaking the "no key in errors" safeguard made the leak test fail.
 - **Not done, and can't be without a key:** any real model call. No real slip has been read. Every Qwen reply in the tests is synthetic.
 
+## Checked by hand in Phase 7
+
+- **Simulated, not recorded.** No game was live while this was built (next NFL kickoff is Thursday 2026-10-01, 8:15 pm ET), so there is **no real recording**. Instead the real `EspnRouter`, breakers, rate limiter, `PollNflLive`, `Settle` and Postgres ran on a fake clock with only the network mocked, over the real scoreboard and box-score JSON edited to a moment in a game (`tests/db/test_live_simulation.py`). That covers: failover within one run when the primary is blocked; every host blocked turns cards red within 5 minutes and shows the unavailable message; recovery without a restart; halftime and a six-minute stopped clock never switching provider; live never settling; `Settle` honouring the ten-minute gate; and the request limits over a whole game and over a 14-game Sunday.
+- **The record, export and replay loop** (`tests/db/test_live_recording.py`): recorded through the real router with an outage in it, exported with the new command, state wiped, replayed through a fresh job: identical final state.
+- **Mutation-style findings while building:** a stuck 14-game slate cost 14 probes per interval (now one per day); the health banner kept calling a recovered fallback "failing" (now ignores half-open providers).
+- **Not done:** any real live game. The status names for halftime and delays (`STATUS_HALFTIME`, `STATUS_END_PERIOD`, delay wording) and the live `period`/`clock` fields are still the spec's expectations, not observed (SPEC.md section 15). The page was tested through `AppTest`, not in a browser on a phone during a game.
+
 ## Next steps
 
 **Phase 2, on the laptop (needs the user):**
@@ -187,6 +207,13 @@ export TEST_DATABASE_URL="$(.venv/bin/python scripts/dev_postgres.py)"
 3. Check every NFL leg from that weekend is either `verified_at` set (nflverse agreed) or has a Review item explaining why not. Legs settled from nflverse (ESPN had no line) stay unverified by design.
 4. Look at `source_health` and the banner for the breakers, and `raw_samples` for anything the parsers rejected. `python -m parlaytracker.cli export-sample <id> <path>` turns a sample into a fixture.
 5. Statuses still **to verify on a live game** (SPEC.md section 15): the halftime and delay names, and the live `period`/`clock` fields. That is Phase 7's recording.
+
+**Phase 7, on the next live game (the code is done):**
+1. Before kickoff, put the game's ESPN event id in `RECORD_EVENT_IDS` in the laptop's `.env` and `compose.sh up -d`. Find the id from the scoreboard (`https://site.web.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard?dates=YYYYMMDD`, field `events[].id`). The next game is Thursday 2026-10-01, 8:15 pm ET (Steelers at Browns on the Odds API's list).
+2. Log a slip with a game total, a team total and a player prop on it, and watch the Live page on the phone during the game. Look for: the clock and status text, the amber and red colours, and that the numbers match the broadcast.
+3. Prove the exit by hand: block `site.web.api.espn.com` mid-game (on the laptop, a `/etc/hosts` line pointing it at `127.0.0.1` works) and check the next poll uses `site.api.espn.com` (Settings and the banner; `source_health`); then block every ESPN host and check the cards turn red within 5 minutes with "Live data unavailable"; then unblock and check it recovers without restarting the worker.
+4. Afterwards `python -m parlaytracker.cli export-recording <event id> tests/fixtures/espn/recording_<id>/` (through `compose.sh run --rm worker ...`), commit it, and add a test that replays it with `tests/support.py::RecordingRouter` through `PollNflLive`. Check the recorded status names against `espn.map_status` and update SPEC.md section 15.
+5. The frozen-feed rule may fire on the real feed (a stopped clock for a review is normal): the logs say "stopped, not frozen" when it doesn't switch.
 
 **Phase 5 is done** (its exit is test-verifiable and passes). Look at the page with real data once a few games have settled; the interesting number early on is CLV, not ROI.
 

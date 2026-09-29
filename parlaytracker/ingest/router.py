@@ -388,8 +388,10 @@ class EspnRouter:
                 errors[source] = f"{kind}: {e}"
                 continue
             self._breakers.success(source)
-            if recording_id in self._record or any(w in response.text for w in watch):
-                self._save(source, "recording", url, response, recording_id, None)
+            watched = recording_id if recording_id in self._record else next(
+                (w for w in sorted(watch) if w in response.text), None)
+            if watched is not None:  # tagged with the watched event, so a game can be exported
+                self._save(source, "recording", url, response, watched, None)
             return Routed(provider, value)
         if limited and last_kind is None:
             raise RateLimited("espn", 0.0)  # skipped, not failed: the next run tries again

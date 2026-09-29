@@ -311,3 +311,37 @@ class SimClock:
     def sleep(self, seconds: float) -> None:
         from datetime import timedelta
         self.now += timedelta(seconds=seconds)
+
+
+class RecordingRouter:
+    """Replays a game exported by `cli export-recording`: each call gets the next response that
+    was recorded for that kind of request, and the last one again once they run out. The job
+    makes the same calls at the same ticks as when it was recorded, so they line up."""
+
+    def __init__(self, directory):
+        from pathlib import Path
+
+        self.breakers = None  # a replay has no providers to break
+        root = Path(directory)
+        self._frames = {"scoreboard": [], "summary": []}
+        for entry in json.loads((root / "index.json").read_text()):
+            self._frames[entry["kind"]].append(
+                (entry["source"], json.loads((root / entry["file"]).read_text())))
+        self._next = {"scoreboard": 0, "summary": 0}
+        self.calls: list[tuple] = []
+
+    def _take(self, kind):
+        frames = self._frames[kind]
+        source, payload = frames[min(self._next[kind], len(frames) - 1)]
+        self._next[kind] += 1
+        return DataSource(source), payload
+
+    def scoreboard(self, sport, day, max_wait=0.0, *, only=None):
+        self.calls.append(("board", day))
+        provider, payload = self._take("scoreboard")
+        return Routed(provider, espn.parse_scoreboard(sport, payload))
+
+    def box_score(self, sport, espn_event_id, max_wait=0.0, *, only=None):
+        self.calls.append(("box", espn_event_id))
+        provider, payload = self._take("summary")
+        return Routed(provider, espn.parse_box_score(sport, payload))
