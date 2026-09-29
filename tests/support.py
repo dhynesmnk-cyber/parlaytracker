@@ -248,3 +248,66 @@ def live_game(status=EventStatus.IN_PROGRESS, period=1, clock=900, home=0, away=
         status_detail="", period=period, clock_seconds=clock,
         home=espn.Team("25", "SF", "San Francisco 49ers"),
         away=espn.Team("22", "ARI", "Arizona Cardinals"), home_score=home, away_score=away)
+
+
+# Frames for the live simulations: the real scoreboard and box-score JSON, edited to a moment
+# in a game. Synthetic timelines built from real documents (not a recording of a live game).
+
+_STATUS_TYPES = {
+    EventStatus.SCHEDULED: ("STATUS_SCHEDULED", "pre", False),
+    EventStatus.IN_PROGRESS: ("STATUS_IN_PROGRESS", "in", False),
+    EventStatus.BREAK: ("STATUS_HALFTIME", "in", False),
+    EventStatus.DELAYED: ("STATUS_DELAYED", "in", False),
+    EventStatus.FINAL: ("STATUS_FINAL", "post", True),
+}
+
+
+def scoreboard_json(base: dict, status: EventStatus, period: int, clock: float, home: int,
+                    away: int, event_id: str = ARI_SF, others: EventStatus | None = None) -> dict:
+    """`base` (a real scoreboard) with `event_id` moved to a moment; `others` sets every other
+    game to one status too (a whole slate in play)."""
+    import copy
+
+    payload = copy.deepcopy(base)
+    for event in payload["events"]:
+        mine = event["id"] == event_id
+        wanted = status if mine else others
+        if wanted is None:
+            continue
+        name, state, completed = _STATUS_TYPES[wanted]
+        event["status"] = {
+            "clock": float(clock), "displayClock": f"{int(clock) // 60}:{int(clock) % 60:02d}",
+            "period": period,
+            "type": {"id": "2", "name": name, "state": state, "completed": completed,
+                     "description": name, "detail": name, "shortDetail": name}}
+        for side in event["competitions"][0]["competitors"]:
+            side["score"] = str(home if side["homeAway"] == "home" else away)
+    return payload
+
+
+def box_json(receptions: int) -> dict:
+    """The real ARI @ SF box score with Trey McBride at `receptions` catches."""
+    import copy
+
+    doc = copy.deepcopy(load("espn", "nfl_summary_401872958_final.json"))
+    for team in doc["boxscore"]["players"]:
+        for group in team["statistics"]:
+            if group.get("name") == "receiving":
+                for a in group["athletes"]:
+                    if a["athlete"]["id"] == MCBRIDE:
+                        a["stats"][group["keys"].index("receptions")] = str(receptions)
+    return doc
+
+
+class SimClock:
+    """One fake clock for the breakers, the rate limiter and the job's ticks."""
+
+    def __init__(self, start: datetime, tick_seconds: float = 30.0):
+        self.start, self.now, self.tick_seconds = start, start, tick_seconds
+
+    def monotonic(self) -> float:
+        return (self.now - self.start).total_seconds()
+
+    def sleep(self, seconds: float) -> None:
+        from datetime import timedelta
+        self.now += timedelta(seconds=seconds)

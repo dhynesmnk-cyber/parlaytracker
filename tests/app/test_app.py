@@ -267,3 +267,20 @@ def test_banner_says_when_the_data_format_changed(app_env, engine):
                odds_api=dict(state=HealthState.OPEN, failure_kind=FailureKind.SCHEMA,
                              open_until=now + timedelta(minutes=30)))
     assert "the data format changed" in warnings(run_main())
+
+
+def test_banner_does_not_warn_about_a_provider_whose_open_time_has_passed(app_env, engine):
+    now = datetime.now(tz=UTC)
+    set_health(engine, worker=dict(state=HealthState.OK, last_success_at=now),
+               espn_site=dict(state=HealthState.OPEN, failure_kind=FailureKind.BLOCKED,
+                              open_until=now - timedelta(minutes=1),
+                              last_success_at=now - timedelta(hours=2)))
+    assert warnings(run_main()) == ""  # half-open: it is waiting for a trial, not failing
+
+
+def test_banner_still_warns_about_a_schema_failure_after_its_open_time_passes(app_env, engine):
+    now = datetime.now(tz=UTC)
+    set_health(engine, worker=dict(state=HealthState.OK, last_success_at=now),
+               espn_web=dict(state=HealthState.OPEN, failure_kind=FailureKind.SCHEMA,
+                             open_until=now - timedelta(minutes=1)))
+    assert "the data format changed" in warnings(run_main())

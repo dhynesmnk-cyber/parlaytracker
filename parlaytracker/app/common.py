@@ -144,6 +144,10 @@ def health_banner(now: datetime | None = None) -> None:
             if row.failure_kind is FailureKind.SCHEMA:
                 st.error(f"{row.source}: the data format changed; the parser needs updating.")
                 continue
+            if row.open_until is not None and row.open_until <= now:
+                continue  # half-open: waiting for a trial, not failing now. A fallback provider
+                # that was blocked earlier isn't retried while the primary works, so its row
+                # would otherwise read "failing" until the next daily canary.
             failing_since = row.last_success_at or row.last_failure_at
             if failing_since and now - failing_since > SOURCE_OPEN_WARN_AFTER:
                 st.warning(f"{row.source} is failing ({row.failure_kind}); last worked "

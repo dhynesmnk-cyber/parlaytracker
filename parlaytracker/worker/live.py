@@ -72,7 +72,7 @@ class PollNflLive:
         # In memory: a restart just makes everything due once, which is what we want.
         self._scoreboard_at: dict[date, datetime] = {}
         self._box_at: dict[int, datetime] = {}
-        self._probe_at: dict[int, datetime] = {}
+        self._probe_at: dict[date, datetime] = {}  # one probe a day covers every game on it
         self._provider: dict[date, DataSource] = {}  # who served each day's last scoreboard
         self._requests_this_tick = 0
 
@@ -138,8 +138,9 @@ class PollNflLive:
                     event.espn_event_id, "not on ESPN's scoreboard for its game day")
                 continue
             self._apply(session, event, game, routed.provider, now)
-            if guards.is_frozen(event.status, event.last_progress_at, now):
-                self._probe(session, day, event, now, out)
+        frozen = [e for e in group if guards.is_frozen(e.status, e.last_progress_at, now)]
+        if frozen:
+            self._probe(session, day, group, frozen, now, out)
 
     def _apply(self, session: Session, event: Event, game: espn.Game, provider: DataSource,
                now: datetime) -> guards.Verdict | None:
@@ -155,14 +156,19 @@ class PollNflLive:
                     leg, event.home_score, event.away_score), provider, now)
         return verdict
 
-    def _probe(self, session: Session, day: date, event: Event, now: datetime,
-               out: LiveSummary) -> None:
+    def _probe(self, session: Session, day: date, group: list[Event], frozen: list[Event],
+               now: datetime, out: LiveSummary) -> None:
         """A frozen feed (section 8.3): ask the other provider once. Only if it is *ahead* is
         the current provider frozen; if it shows the same, the game itself has stopped (a
-        review, an injury) and nothing changes."""
-        if not guards.may_probe(self._probe_at.get(event.id), now):
+        review, an injury) and nothing changes.
+
+        The probe returns the whole day, so one request a day (at most every 5 minutes) covers
+        every frozen game on it: at most once per event, as the spec requires, and not once
+        per game when a whole slate looks stuck.
+        """
+        if not guards.may_probe(self._probe_at.get(day), now):
             return
-        self._probe_at[event.id] = now
+        self._probe_at[day] = now
         current = self._provider.get(day, DataSource.ESPN_WEB)
         other = other_score_provider(current)
         self._pace()
@@ -172,23 +178,28 @@ class PollNflLive:
             log.info("frozen-feed probe of %s skipped: %s", other, e)
             return
         out.probes += 1
-        game = next((g for g in routed.value.games if g.espn_event_id == event.espn_event_id),
-                    None)
-        if game is None:
+        games = {g.espn_event_id: g for g in routed.value.games}
+
+        def ahead(event: Event) -> bool:
+            game = games.get(event.espn_event_id)
+            if game is None:
+                return False
+            key = guards.progress_key(Sport.NFL, game.status, game.period, game.clock_seconds)
+            return key is not None and guards.compare(key, _key(event)) is guards.Verdict.ADVANCE
+
+        proof = [e for e in frozen if ahead(e)]
+        if not proof:
+            log.info("no change on %d game(s) for 5+ minutes, and %s agrees: stopped, not frozen",
+                     len(frozen), other)
             return
-        probe_key = guards.progress_key(Sport.NFL, game.status, game.period, game.clock_seconds)
-        ahead = probe_key is not None and (
-            guards.compare(probe_key, _key(event)) is guards.Verdict.ADVANCE)
-        if not ahead:
-            log.info("event %s: no change for %s, and %s agrees: the game is stopped",
-                     event.espn_event_id, now - (event.last_progress_at or now), other)
-            return
-        log.warning("event %s: %s is frozen and %s is ahead: switching", event.espn_event_id,
-                    current, other)
+        log.warning("%s is frozen on %s and %s is ahead: switching", current,
+                    ", ".join(e.espn_event_id for e in proof), other)
         self._router.breakers.failure(current.value, FailureKind.FROZEN,
                                       f"feed frozen; {other.value} is ahead")
         self._provider[day] = routed.provider
-        self._apply(session, event, game, routed.provider, now)
+        for event in group:  # the fresher provider's data for everything on the day
+            if event.espn_event_id in games:
+                self._apply(session, event, games[event.espn_event_id], routed.provider, now)
         out.switched += 1
 
     def _box(self, session: Session, event: Event, now: datetime, out: LiveSummary) -> None:
