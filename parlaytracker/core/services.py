@@ -420,6 +420,24 @@ def settle_leg_auto(session: Session, leg: Leg, *, final_value: Decimal, source:
     return refresh_slip(session, leg.slip, now)
 
 
+def set_live_value(session: Session, leg: Leg, value: Decimal | None, source: DataSource,
+                   now: datetime | None = None) -> Leg:
+    """Record what a leg stands at right now, for the Live page (section 9.4).
+
+    Display only: this never touches `result`, and it refuses a leg that has settled, so a
+    live value can never overwrite or stand in for a settlement (constraint 2).
+    """
+    if leg.result is not LegResult.PENDING:
+        raise ServiceError("a settled leg has no live value")
+    if source not in AUTO_SOURCES:
+        raise ServiceError(f"{source} is not an automatic source")
+    leg.live_value = value
+    leg.live_updated_at = now or _now()
+    leg.live_source = source
+    session.flush()
+    return leg
+
+
 def flag_leg(session: Session, leg: Leg, reason: str) -> Leg:
     """Send a leg to Review. Idempotent: an existing flag keeps its original reason."""
     if not leg.needs_review:

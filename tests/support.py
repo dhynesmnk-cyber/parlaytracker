@@ -167,3 +167,84 @@ def analytics_leg(result=None, odds=-110, line="45.5", **kw):
         logged_by="a@example.com", line=Decimal(line), odds=odds,
         result=result or LegResult.WIN)
     return LegRow(**{**defaults, **kw})
+
+
+# --- Live tracking ----------------------------------------------------------------------------
+
+
+class LiveRouter:
+    """A scoreboard and box-score source for `poll_nfl_live`, with a per-provider feed so a test
+    can freeze one, block one, or advance both. It keeps the real router's contract: the first
+    provider whose breaker is open is skipped, a failing one is recorded on the breaker, and
+    `only=` asks one provider."""
+
+    ORDER = (DataSource.ESPN_WEB, DataSource.ESPN_SITE)
+
+    def __init__(self, breakers=None):
+        from parlaytracker.ingest.router import Breakers
+
+        self.breakers = breakers or Breakers(engine=None)
+        # provider -> day -> ScoreboardResult, and provider -> event id -> BoxScore
+        self.boards: dict[DataSource, dict] = {p: {} for p in self.ORDER}
+        self.boxes: dict[DataSource, dict] = {p: {} for p in (*self.ORDER, DataSource.ESPN_CDN)}
+        self.down: set[DataSource] = set()
+        self.calls: list[tuple] = []
+
+    def _fail(self, provider):
+        from parlaytracker.core.models import FailureKind
+        self.breakers.failure(provider.value, FailureKind.BLOCKED, "403")
+
+    def scoreboard(self, sport, day, max_wait=0.0, *, only=None):
+        from parlaytracker.ingest.router import ProviderOpen
+        errors = {}
+        for provider in ([only] if only else self.ORDER):
+            try:
+                self.breakers.allow(provider.value)
+            except ProviderOpen as e:
+                errors[provider.value] = str(e)
+                continue
+            self.calls.append(("board", provider, day))
+            if provider in self.down:
+                self._fail(provider)
+                errors[provider.value] = "blocked"
+                continue
+            self.breakers.success(provider.value)
+            return Routed(provider, self.boards[provider][day])
+        raise AllProvidersFailed(errors)
+
+    def box_score(self, sport, espn_event_id, max_wait=0.0, *, only=None):
+        from parlaytracker.ingest.router import ProviderOpen
+        errors = {}
+        for provider in ([only] if only else list(self.boxes)):
+            try:
+                self.breakers.allow(provider.value)
+            except ProviderOpen as e:
+                errors[provider.value] = str(e)
+                continue
+            self.calls.append(("box", provider, espn_event_id))
+            if provider in self.down:
+                self._fail(provider)
+                errors[provider.value] = "blocked"
+                continue
+            self.breakers.success(provider.value)
+            return Routed(provider, self.boxes[provider][espn_event_id])
+        raise AllProvidersFailed(errors)
+
+    def count(self, kind: str) -> int:
+        return sum(1 for c in self.calls if c[0] == kind)
+
+    def serve(self, day, game_or_games, providers=None):
+        """Both (or the given) providers answer this day's scoreboard with these games."""
+        games = game_or_games if isinstance(game_or_games, list) else [game_or_games]
+        for p in providers or self.ORDER:
+            self.boards[p][day] = espn.ScoreboardResult(list(games), {})
+
+
+def live_game(status=EventStatus.IN_PROGRESS, period=1, clock=900, home=0, away=0,
+              espn_id=ARI_SF, start=KICKOFF):
+    """A scoreboard game for ARI @ SF at a given moment."""
+    return espn.Game(
+        espn_event_id=espn_id, sport=Sport.NFL, start_time=start, status=status,
+        status_detail="", period=period, clock_seconds=clock,
+        home=espn.Team("25", "SF", "San Francisco 49ers"),
+        away=espn.Team("22", "ARI", "Arizona Cardinals"), home_score=home, away_score=away)

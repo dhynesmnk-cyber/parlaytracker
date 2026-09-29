@@ -1,8 +1,7 @@
 """Background worker: `python -m parlaytracker.worker` (SPEC.md section 8).
 
-Phases 3 and 4 register `heartbeat`, `capture_closing`, `check_finals`, `settle`,
-`recheck_settled`, `verify_nfl`, `canary` and `prune_samples`. Phase 7 adds `poll_nfl_live`
-(section 8.1).
+Phases 3, 4 and 7 register `heartbeat`, `capture_closing`, `poll_nfl_live`, `check_finals`,
+`settle`, `recheck_settled`, `verify_nfl`, `canary` and `prune_samples` (section 8.1).
 """
 import logging
 import signal
@@ -17,6 +16,7 @@ from parlaytracker.ingest.nflverse import NflverseData
 from parlaytracker.ingest.odds_api import OddsApiClient
 from parlaytracker.ingest.router import Breakers, EspnRouter
 from parlaytracker.worker.jobs import ClosingCapture, guarded, heartbeat
+from parlaytracker.worker.live import PollNflLive
 from parlaytracker.worker.settle import (
     Canary,
     CheckFinals,
@@ -34,6 +34,7 @@ log = logging.getLogger("parlaytracker.worker")
 LOCK_KEY = 7_406_110_417
 HEARTBEAT_SECONDS = 60
 CAPTURE_SECONDS = 60
+LIVE_SECONDS = 30
 CHECK_FINALS_MINUTES = 15
 SETTLE_MINUTES = 5
 RECHECK_MINUTES = 60
@@ -68,6 +69,7 @@ def build_scheduler(engine: Engine, breakers: Breakers, odds: OddsApiClient | No
     if odds is not None:
         add("capture_closing", ClosingCapture(engine, odds, breakers, reserve), "interval",
             seconds=CAPTURE_SECONDS)
+    add("poll_nfl_live", PollNflLive(engine, router), "interval", seconds=LIVE_SECONDS)
     add("check_finals", CheckFinals(engine, router), "interval", minutes=CHECK_FINALS_MINUTES)
     add("settle", Settle(engine, router), "interval", minutes=SETTLE_MINUTES)
     add("recheck_settled", RecheckSettled(engine, router), "interval", minutes=RECHECK_MINUTES)

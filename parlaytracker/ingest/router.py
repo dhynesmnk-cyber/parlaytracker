@@ -251,6 +251,11 @@ class SampleRecord:
     body: str
 
 
+def other_score_provider(current: DataSource) -> DataSource:
+    """The provider a frozen-feed probe asks: the other scoreboard host (section 8.3)."""
+    return DataSource.ESPN_SITE if current is DataSource.ESPN_WEB else DataSource.ESPN_WEB
+
+
 class AllProvidersFailed(Exception):
     """Every ESPN provider was skipped or failed. `errors` says why, per provider."""
 
@@ -291,8 +296,10 @@ class EspnRouter:
 
     # --- public requests -------------------------------------------------------------------
 
-    def scoreboard(self, sport: Sport, day: date, max_wait: float = 0.0
-                   ) -> Routed[espn.ScoreboardResult]:
+    def scoreboard(self, sport: Sport, day: date, max_wait: float = 0.0, *,
+                   only: DataSource | None = None) -> Routed[espn.ScoreboardResult]:
+        """A day's scoreboard from the first working provider, or from `only` (the frozen-feed
+        probe asks the other provider, section 8.3)."""
         path = f"{espn.SPORT_PATHS[sport]}/scoreboard"
 
         def check(result: espn.ScoreboardResult) -> None:
@@ -304,7 +311,7 @@ class EspnRouter:
         return self._route(
             _SCORE_PROVIDERS, lambda p, w: self._get_site(p, path, params, w),
             lambda payload: espn.parse_scoreboard(sport, payload), check, max_wait,
-            recording_id=None, watch=self._record)
+            recording_id=None, watch=self._record, only=only)
 
     def box_score(self, sport: Sport, espn_event_id: str, max_wait: float = 0.0, *,
                   only: DataSource | None = None) -> Routed[espn.BoxScore]:
