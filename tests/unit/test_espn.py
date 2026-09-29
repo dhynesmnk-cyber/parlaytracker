@@ -156,6 +156,9 @@ SITE = "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard"
 def fresh_limiter(monkeypatch):
     """No waiting in tests: every host gets a fresh limiter with no spacing."""
     monkeypatch.setattr(espn, "LIMITER", RateLimiter(per_host_interval=0, per_minute=1000))
+    espn.reset_default_router()  # fresh breakers too: one test's 403 must not leak into the next
+    yield
+    espn.reset_default_router()
 
 
 @respx.mock
@@ -175,8 +178,9 @@ def test_fetch_falls_back_when_primary_is_blocked():
         403, text=(FIXTURES / "akamai_403.html").read_text(), headers={"Server": "AkamaiGHost"}))
     respx.get(SITE).mock(return_value=httpx.Response(
         200, json=load("nfl_scoreboard_2026-09-28_scheduled.json")))
-    provider, _ = espn.fetch_json("football/nfl/scoreboard", {"dates": "20260928"})
-    assert provider is DataSource.ESPN_SITE
+    routed = espn.default_router().scoreboard(Sport.NFL, date(2026, 9, 28))
+    assert routed.provider is DataSource.ESPN_SITE
+    assert not espn.default_router().breakers["espn_web"].allow()  # blocked: open for 10 min
 
 
 @pytest.mark.parametrize(
@@ -195,17 +199,20 @@ def test_failures_are_classified(response, kind):
     respx.get(WEB).mock(return_value=response)
     respx.get(SITE).mock(return_value=response)
     with pytest.raises(FetchError) as info:
-        espn.fetch_json("football/nfl/scoreboard")
+        espn.fetch_scoreboard(Sport.NFL, date(2026, 9, 28))
     assert info.value.kind is kind
 
 
 @respx.mock
-def test_retry_after_is_kept():
+def test_retry_after_sets_how_long_the_breaker_stays_open():
     respx.get(WEB).mock(return_value=httpx.Response(429, headers={"Retry-After": "90"}))
-    respx.get(SITE).mock(return_value=httpx.Response(429, headers={"Retry-After": "90"}))
-    with pytest.raises(FetchError) as info:
-        espn.fetch_json("football/nfl/scoreboard")
-    assert info.value.retry_after == 90
+    respx.get(SITE).mock(return_value=httpx.Response(429))
+    with pytest.raises(FetchError):
+        espn.fetch_scoreboard(Sport.NFL, date(2026, 9, 28))
+    breakers = espn.default_router().breakers
+    web, site = breakers["espn_web"], breakers["espn_site"]
+    assert (web.open_until - web.last_failure_at).total_seconds() == 90
+    assert (site.open_until - site.last_failure_at).total_seconds() == 300  # no Retry-After
 
 
 @respx.mock
@@ -213,13 +220,14 @@ def test_timeout_is_transient():
     respx.get(WEB).mock(side_effect=httpx.ConnectTimeout("slow"))
     respx.get(SITE).mock(side_effect=httpx.ReadTimeout("slow"))
     with pytest.raises(FetchError) as info:
-        espn.fetch_json("football/nfl/scoreboard")
+        espn.fetch_scoreboard(Sport.NFL, date(2026, 9, 28))
     assert info.value.kind is FailureKind.TRANSIENT
 
 
 @respx.mock
 def test_changed_format_is_a_schema_failure():
     respx.get(WEB).mock(return_value=httpx.Response(200, json={"games": []}))
+    respx.get(SITE).mock(return_value=httpx.Response(200, json={"games": []}))
     with pytest.raises(FetchError) as info:
         espn.fetch_scoreboard(Sport.NFL, date(2026, 9, 28))
     assert info.value.kind is FailureKind.SCHEMA

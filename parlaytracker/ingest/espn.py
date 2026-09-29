@@ -5,15 +5,17 @@ with Pydantic and return typed dataclasses. A malformed event is reported for th
 only; a malformed document raises SchemaError.
 """
 import logging
+import threading
 from dataclasses import dataclass
 from datetime import date, datetime
+from decimal import Decimal, InvalidOperation
 from typing import Any, Literal
 from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, ValidationError
 
-from parlaytracker.core.models import DataSource, EventStatus, FailureKind, Sport
-from parlaytracker.ingest.http import FetchError, RateLimiter, get_json
+from parlaytracker.core.models import DataSource, EventStatus, FailureKind, MarketType, Sport
+from parlaytracker.ingest.http import FetchError, RateLimiter
 
 log = logging.getLogger(__name__)
 
@@ -25,12 +27,15 @@ SPORT_PATHS = {
     Sport.MLB: "baseball/mlb",
     Sport.NHL: "hockey/nhl",
 }
-# Tried in order (section 6.1). cdn.espn.com serves a different document shape and is added
-# with the summary parser in Phase 4.
+# Tried in order (section 6.1). cdn.espn.com serves the box score only, wrapped in
+# `gamepackageJSON`; see CDN_URL and `parse_box_score`.
 HOSTS: list[tuple[DataSource, str]] = [
     (DataSource.ESPN_WEB, "https://site.web.api.espn.com"),
     (DataSource.ESPN_SITE, "https://site.api.espn.com"),
 ]
+
+CDN_URL = "https://cdn.espn.com/core/{league}/game"
+CDN_LEAGUES = {Sport.NFL: "nfl", Sport.NBA: "nba", Sport.MLB: "mlb", Sport.NHL: "nhl"}
 
 # One limiter per process for all ESPN hosts: 1 request / 2 s per host, 20 / minute overall.
 LIMITER = RateLimiter(per_host_interval=2.0, per_minute=20)
@@ -95,6 +100,20 @@ class RosterPlayer:
     @property
     def label(self) -> str:
         return f"{self.name} ({self.position})" if self.position else self.name
+
+
+@dataclass(frozen=True)
+class BoxScore:
+    """What settlement needs from a summary (or cdn) document."""
+    espn_event_id: str
+    status: EventStatus
+    home_espn_team_id: str
+    away_espn_team_id: str
+    home_score: int | None
+    away_score: int | None
+    # market -> ESPN athlete id -> final value, for the player markets the sport has
+    stats: dict[MarketType, dict[str, Decimal]]
+    did_not_play: frozenset[str]  # athletes ESPN says didn't play (NBA `didNotPlay`)
 
 
 # --- Raw shapes (only the fields we use) ---------------------------------------------------
@@ -262,39 +281,179 @@ def parse_roster(payload: Any) -> list[RosterPlayer]:
     return sorted(players.values(), key=lambda p: (p.unavailable, p.name))
 
 
-# --- Fetching ------------------------------------------------------------------------------
+# --- Fetching (web app) ----------------------------------------------------------------------
+
+_router = None
+_router_lock = threading.Lock()
 
 
-def fetch_json(path: str, params: dict[str, str] | None = None,
-               max_wait: float = 0.0) -> tuple[DataSource, Any]:
-    """GET `path` from the first ESPN host that answers (section 6.1). Returns the provider.
+def default_router():
+    """The web app's router: the same failover and failure rules as the worker's, with
+    in-memory breakers of its own (section 8.3)."""
+    global _router
+    from parlaytracker.ingest.router import Breakers, EspnRouter  # router imports this module
+    with _router_lock:
+        if _router is None:
+            _router = EspnRouter(Breakers(engine=None))
+        return _router
 
-    Every host failing raises the last FetchError. The Phase 4 router adds circuit breakers.
-    """
-    last: FetchError | None = None
-    for provider, host in HOSTS:
-        try:
-            return provider, get_json(f"{host}{BASE_PATH}/{path}", params, LIMITER, max_wait)
-        except FetchError as e:
-            log.warning("ESPN %s failed: %s", provider, e)
-            last = e
-    assert last is not None
-    raise last
+
+def reset_default_router() -> None:
+    global _router
+    with _router_lock:
+        _router = None
+
+
+def _as_fetch_error(path: str, e: Exception) -> FetchError:
+    from parlaytracker.ingest.router import AllProvidersFailed
+    kind = e.kind if isinstance(e, AllProvidersFailed) and e.kind else FailureKind.TRANSIENT
+    return FetchError(path, kind, str(e))
 
 
 def fetch_scoreboard(sport: Sport, day: date, max_wait: float = 0.0) -> ScoreboardResult:
-    _, payload = fetch_json(f"{SPORT_PATHS[sport]}/scoreboard",
-                            {"dates": day.strftime("%Y%m%d")}, max_wait)
+    from parlaytracker.ingest.router import AllProvidersFailed
     try:
-        return parse_scoreboard(sport, payload)
-    except SchemaError as e:
-        raise FetchError(f"{SPORT_PATHS[sport]}/scoreboard", FailureKind.SCHEMA, str(e)) from e
+        return default_router().scoreboard(sport, day, max_wait).value
+    except AllProvidersFailed as e:
+        raise _as_fetch_error(f"{SPORT_PATHS[sport]}/scoreboard", e) from e
 
 
 def fetch_roster(sport: Sport, team_id: str, max_wait: float = 0.0) -> list[RosterPlayer]:
-    path = f"{SPORT_PATHS[sport]}/teams/{team_id}/roster"
-    _, payload = fetch_json(path, None, max_wait)
+    from parlaytracker.ingest.router import AllProvidersFailed
     try:
-        return parse_roster(payload)
-    except SchemaError as e:
-        raise FetchError(path, FailureKind.SCHEMA, str(e)) from e
+        return default_router().roster(sport, team_id, max_wait).value
+    except AllProvidersFailed as e:
+        raise _as_fetch_error(f"{SPORT_PATHS[sport]}/teams/{team_id}/roster", e) from e
+
+
+# --- Box scores (summary and cdn) ------------------------------------------------------------
+
+# (box-score group names, column keys summed) per player market. Keys, never positions or
+# labels (section 6.1). NHL has no points column: goals + assists. NBA's group has no name.
+_NO_NAME = ""
+STAT_COLUMNS: dict[Sport, dict[MarketType, tuple[tuple[str, ...], tuple[str, ...]]]] = {
+    Sport.NFL: {
+        MarketType.PLAYER_RECEPTIONS: (("receiving",), ("receptions",)),
+        MarketType.PLAYER_RECEIVING_YARDS: (("receiving",), ("receivingYards",)),
+        MarketType.PLAYER_RUSHING_YARDS: (("rushing",), ("rushingYards",)),
+        MarketType.PLAYER_PASSING_YARDS: (("passing",), ("passingYards",)),
+    },
+    Sport.NBA: {MarketType.PLAYER_POINTS: ((_NO_NAME,), ("points",))},
+    Sport.NHL: {MarketType.PLAYER_POINTS: (("forwards", "defenses"), ("goals", "assists"))},
+    Sport.MLB: {},
+}
+
+
+class _BoxTeamIdRaw(BaseModel):
+    id: str
+
+
+class _BoxAthleteIdRaw(BaseModel):
+    id: str
+
+
+class _BoxCompetitorRaw(BaseModel):
+    homeAway: Literal["home", "away"]
+    score: str | None = None
+    id: str | None = None
+    team: _BoxTeamIdRaw | None = None
+
+
+class _BoxCompetitionRaw(BaseModel):
+    competitors: list[_BoxCompetitorRaw]
+    status: _StatusRaw
+
+
+class _BoxHeaderRaw(BaseModel):
+    id: str
+    competitions: list[_BoxCompetitionRaw]
+
+
+class _BoxAthleteRaw(BaseModel):
+    athlete: _BoxAthleteIdRaw
+    stats: list[str] = []
+    didNotPlay: bool = False
+
+
+class _BoxGroupRaw(BaseModel):
+    name: str | None = None
+    keys: list[str] = []
+    athletes: list[_BoxAthleteRaw] = []
+
+
+class _BoxTeamPlayersRaw(BaseModel):
+    statistics: list[_BoxGroupRaw] = []
+
+
+class _BoxRaw(BaseModel):
+    players: list[_BoxTeamPlayersRaw] = []
+
+
+class _BoxDocRaw(BaseModel):
+    header: _BoxHeaderRaw
+    boxscore: _BoxRaw
+
+
+def unwrap_cdn(payload: Any) -> Any:
+    """cdn.espn.com wraps the summary document in `gamepackageJSON` (verified, section 6.1)."""
+    if isinstance(payload, dict) and "gamepackageJSON" in payload:
+        return payload["gamepackageJSON"]
+    return payload
+
+
+def _stat_value(text: str) -> Decimal:
+    try:
+        value = Decimal(text)
+    except InvalidOperation as e:
+        raise ValueError(f"not a number: {text!r}") from e
+    if not value.is_finite():
+        raise ValueError(f"not a number: {text!r}")
+    return value
+
+
+def _team_id(c: _BoxCompetitorRaw) -> str:
+    team_id = c.team.id if c.team else c.id
+    if team_id is None:
+        raise ValueError("competitor has no team id")
+    return team_id
+
+
+def parse_box_score(sport: Sport, payload: Any) -> BoxScore:
+    """Parse a summary or cdn document. Raises SchemaError if it isn't one we understand."""
+    try:
+        doc = _BoxDocRaw.model_validate(unwrap_cdn(payload))
+        header = doc.header
+        if len(header.competitions) != 1:
+            raise ValueError(f"expected 1 competition, got {len(header.competitions)}")
+        comp = header.competitions[0]
+        sides = {c.homeAway: c for c in comp.competitors}
+        if set(sides) != {"home", "away"}:
+            raise ValueError("expected one home and one away competitor")
+        state = comp.status.type.state
+        stats: dict[MarketType, dict[str, Decimal]] = {m: {} for m in STAT_COLUMNS[sport]}
+        did_not_play: set[str] = set()
+        for team in doc.boxscore.players:
+            for group in team.statistics:
+                for market, (groups, columns) in STAT_COLUMNS[sport].items():
+                    if (group.name or _NO_NAME) not in groups:
+                        continue
+                    idx = [group.keys.index(c) for c in columns]  # ValueError if a key is gone
+                    for a in group.athletes:
+                        if a.didNotPlay:
+                            did_not_play.add(a.athlete.id)
+                        elif a.stats:
+                            if len(a.stats) != len(group.keys):
+                                raise ValueError(f"athlete {a.athlete.id} has {len(a.stats)} "
+                                                 f"stats for {len(group.keys)} keys")
+                            stats[market][a.athlete.id] = sum(
+                                (_stat_value(a.stats[i]) for i in idx), Decimal(0))
+        return BoxScore(
+            espn_event_id=header.id,
+            status=map_status(comp.status.type.name, state, comp.status.type.completed),
+            home_espn_team_id=_team_id(sides["home"]), away_espn_team_id=_team_id(sides["away"]),
+            home_score=_score(sides["home"].score, state),
+            away_score=_score(sides["away"].score, state),
+            stats=stats, did_not_play=frozenset(did_not_play),
+        )
+    except (ValidationError, ValueError, TypeError) as e:
+        raise SchemaError(f"box score: {str(e).splitlines()[0]}") from e

@@ -35,6 +35,8 @@ MARKET_LABELS = {
 WEB_MAX_WAIT = 5.0
 WORKER_STALE_AFTER = timedelta(minutes=3)
 SOURCE_OPEN_WARN_AFTER = timedelta(minutes=5)
+# One capture costs a credit per market, so warn a few calls before the reserve is reached.
+MARKETS_PER_CAPTURE = 10
 
 
 def display_tz() -> ZoneInfo:
@@ -129,6 +131,13 @@ def health_banner(now: datetime | None = None) -> None:
         elif now - worker.last_success_at > WORKER_STALE_AFTER:
             st.warning(f"The background worker was last seen {fmt_time(worker.last_success_at)}. "
                        "Live data and closing lines are paused until it's back.")
+        odds = rows.get("odds_api")
+        reserve = get_settings().odds_api_reserve
+        if odds is not None and odds.quota_remaining is not None and (
+                odds.quota_remaining < reserve + MARKETS_PER_CAPTURE):
+            st.warning(f"The Odds API has {odds.quota_remaining} credits left this month. "
+                       f"Closing lines stop being captured at {reserve}; enter them by hand "
+                       "on the Review page after that.")
         for row in rows.values():
             if row.state is not HealthState.OPEN:
                 continue

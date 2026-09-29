@@ -5,7 +5,10 @@ only decide the outcome from final values.
 """
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime, time, timedelta
 from decimal import Decimal
+from enum import StrEnum
+from zoneinfo import ZoneInfo
 
 from parlaytracker.core.models import LegResult, MarketType, SlipStatus, SlipType, TeamSide
 from parlaytracker.core.odds import decimal_odds, parlay_decimal, payout
@@ -103,3 +106,52 @@ def settle_slip(
     if not is_placed:
         return SlipOutcome(SlipStatus.VOID, refund)
     return SlipOutcome(SlipStatus.PENDING, None, review_reason=REDUCED_PARLAY_REASON)
+
+
+# --- An NFL player missing from ESPN's box score (SPEC.md section 7.1) -----------------------
+
+ET = ZoneInfo("America/New_York")
+NO_STAT_NO_SNAPS_REASON = "No stat line and no snaps: likely void"
+PLAYED_NO_STAT_NOTE = "Played, no stat"
+
+
+class MissingPlayer(StrEnum):
+    WAIT = "wait"                       # nothing to go on yet
+    SETTLE_FROM_NFLVERSE = "nflverse"   # nflverse has a stat line
+    SETTLE_ZERO_PLAYED = "zero_played"  # no stat line, but he took snaps: value 0
+    REVIEW_NO_SNAPS = "review"          # no stat line and no snaps: likely void
+
+
+def tuesday_deadline(start_time: datetime) -> datetime:
+    """The end of the first Tuesday (US Eastern) after the game day, in UTC.
+
+    nflverse's stat lines and snap counts are normally out by then, so a player with neither
+    after it is treated as having no snaps.
+    """
+    game_day = start_time.astimezone(ET).date()
+    days = (1 - game_day.weekday()) % 7 or 7  # Tuesday is weekday 1
+    tuesday = game_day + timedelta(days=days)
+    return datetime.combine(tuesday, time.max, tzinfo=ET).astimezone(UTC)
+
+
+def resolve_missing_nfl_player(
+    nflverse_value: Decimal | None, offense_snaps: float | None, start_time: datetime,
+    now: datetime,
+) -> tuple[MissingPlayer, Decimal | None]:
+    """What to do with a pending NFL player leg that ESPN's box score doesn't list.
+
+    Never void automatically, and never assume zero without evidence (section 7.1):
+    - a nflverse stat line settles it;
+    - otherwise snaps > 0 mean he played: settle at 0 ("Played, no stat");
+    - zero snaps, or still no snap data after the Tuesday following the game: Review;
+    - otherwise wait for nflverse.
+    """
+    if nflverse_value is not None:
+        return MissingPlayer.SETTLE_FROM_NFLVERSE, nflverse_value
+    if offense_snaps is not None:
+        if offense_snaps > 0:
+            return MissingPlayer.SETTLE_ZERO_PLAYED, Decimal(0)
+        return MissingPlayer.REVIEW_NO_SNAPS, None
+    if now > tuesday_deadline(start_time):
+        return MissingPlayer.REVIEW_NO_SNAPS, None
+    return MissingPlayer.WAIT, None

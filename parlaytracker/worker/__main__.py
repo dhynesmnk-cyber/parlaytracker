@@ -1,19 +1,31 @@
 """Background worker: `python -m parlaytracker.worker` (SPEC.md section 8).
 
-Phase 2 only holds the single-instance lock and writes a heartbeat, so the app can show when
-the worker is down. Phase 3 adds the scheduler and its jobs.
+Phases 3 and 4 register `heartbeat`, `capture_closing`, `check_finals`, `settle`,
+`recheck_settled`, `verify_nfl`, `canary` and `prune_samples`. Phase 7 adds `poll_nfl_live`
+(section 8.1).
 """
 import logging
 import signal
 import sys
-import threading
-from datetime import UTC, datetime
 
+from apscheduler.schedulers.blocking import BlockingScheduler
 from sqlalchemy import Connection, Engine, text
-from sqlalchemy.dialects.postgresql import insert
 
+from parlaytracker.core.config import get_settings
 from parlaytracker.core.db import make_engine
-from parlaytracker.core.models import HealthState, SourceHealth
+from parlaytracker.ingest.nflverse import NflverseData
+from parlaytracker.ingest.odds_api import OddsApiClient
+from parlaytracker.ingest.router import Breakers, EspnRouter
+from parlaytracker.worker.jobs import ClosingCapture, guarded, heartbeat
+from parlaytracker.worker.settle import (
+    Canary,
+    CheckFinals,
+    RecheckSettled,
+    Settle,
+    VerifyNfl,
+    prune_samples,
+    sample_sink,
+)
 
 log = logging.getLogger("parlaytracker.worker")
 
@@ -21,6 +33,11 @@ log = logging.getLogger("parlaytracker.worker")
 # and spend Odds API credits twice (section 8.1).
 LOCK_KEY = 7_406_110_417
 HEARTBEAT_SECONDS = 60
+CAPTURE_SECONDS = 60
+CHECK_FINALS_MINUTES = 15
+SETTLE_MINUTES = 5
+RECHECK_MINUTES = 60
+ET = "America/New_York"
 
 
 def try_lock(conn: Connection) -> bool:
@@ -30,26 +47,36 @@ def try_lock(conn: Connection) -> bool:
     return bool(locked)
 
 
-def heartbeat(engine: Engine, now: datetime | None = None) -> None:
-    now = now or datetime.now(tz=UTC)
-    stmt = insert(SourceHealth).values(source="worker", state=HealthState.OK, last_success_at=now,
-                                       consecutive_failures=0, requests_last_hour=0,
-                                       errors_last_hour=0)
-    stmt = stmt.on_conflict_do_update(index_elements=[SourceHealth.source],
-                                      set_={"last_success_at": now, "state": HealthState.OK})
-    with engine.begin() as conn:
-        conn.execute(stmt)
+def build_scheduler(engine: Engine, breakers: Breakers, odds: OddsApiClient | None,
+                    reserve: int, record_event_ids: frozenset[str] = frozenset()
+                    ) -> BlockingScheduler:
+    """Every job runs with coalesce=True, max_instances=1, misfire_grace_time=30."""
+    scheduler = BlockingScheduler(
+        timezone="UTC",
+        job_defaults={"coalesce": True, "max_instances": 1, "misfire_grace_time": 30})
+    router = EspnRouter(breakers, sample_sink=sample_sink(engine),
+                        record_event_ids=record_event_ids)
 
+    def nflverse() -> NflverseData:
+        return NflverseData(breakers)  # a fresh one per run: each dataset loads once per run
 
-def run(engine: Engine, stop: threading.Event, interval: float = HEARTBEAT_SECONDS) -> None:
-    """Beat until `stop` is set. A failed beat is logged, never fatal."""
-    while True:
-        try:
-            heartbeat(engine)
-        except Exception:
-            log.exception("heartbeat failed")
-        if stop.wait(interval):
-            return
+    def add(name: str, job, trigger: str, **when) -> None:
+        scheduler.add_job(guarded(engine, name, job), trigger, id=name, name=name, **when)
+
+    add("heartbeat", lambda: heartbeat(engine, breakers=breakers), "interval",
+        seconds=HEARTBEAT_SECONDS)
+    if odds is not None:
+        add("capture_closing", ClosingCapture(engine, odds, breakers, reserve), "interval",
+            seconds=CAPTURE_SECONDS)
+    add("check_finals", CheckFinals(engine, router), "interval", minutes=CHECK_FINALS_MINUTES)
+    add("settle", Settle(engine, router), "interval", minutes=SETTLE_MINUTES)
+    add("recheck_settled", RecheckSettled(engine, router), "interval", minutes=RECHECK_MINUTES)
+    add("verify_nfl", VerifyNfl(engine, nflverse), "cron", hour=10, minute=0, timezone=ET)
+    canary = Canary(router, nflverse)
+    add("canary", canary, "cron", hour=9, minute=0, timezone=ET)
+    add("canary_at_startup", canary, "date")  # run_date omitted: as soon as the scheduler starts
+    add("prune_samples", lambda: prune_samples(engine), "cron", hour=4, minute=0, timezone="UTC")
+    return scheduler
 
 
 def main() -> int:
@@ -59,11 +86,23 @@ def main() -> int:
     if not try_lock(lock_conn):
         log.error("another worker already holds the lock; exiting")
         return 1
-    stop = threading.Event()
-    for sig in (signal.SIGTERM, signal.SIGINT):
-        signal.signal(sig, lambda *_: stop.set())
-    log.info("worker started (Phase 2: heartbeat only)")
-    run(engine, stop)
+
+    settings = get_settings()
+    breakers = Breakers(engine)
+    breakers.load()
+    odds = None
+    if settings.odds_api_key is not None:
+        odds = OddsApiClient(settings.odds_api_key.get_secret_value(), breakers)
+    else:
+        log.warning("ODDS_API_KEY is not set: closing lines will not be captured")
+
+    scheduler = build_scheduler(engine, breakers, odds, settings.odds_api_reserve,
+                                frozenset(settings.record_event_ids))
+    signal.signal(signal.SIGTERM, lambda *_: scheduler.shutdown(wait=False))
+    signal.signal(signal.SIGINT, lambda *_: scheduler.shutdown(wait=False))
+    guarded(engine, "heartbeat", lambda: heartbeat(engine, breakers=breakers))()  # at once
+    log.info("worker started (closing lines %s)", "on" if odds else "off: no ODDS_API_KEY")
+    scheduler.start()  # blocks until shutdown
     log.info("worker stopped")
     lock_conn.close()
     return 0

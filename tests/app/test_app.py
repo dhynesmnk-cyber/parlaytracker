@@ -13,12 +13,15 @@ from parlaytracker.core.db import session_scope
 from parlaytracker.core.models import (
     DataSource,
     EventStatus,
+    FailureKind,
+    HealthState,
     Leg,
     LegResult,
     MarketType,
     Slip,
     SlipStatus,
     SlipType,
+    SourceHealth,
     Sport,
     Sportsbook,
     Tag,
@@ -208,3 +211,59 @@ def test_settings_adds_and_retires_a_tag(app_env):
     next(b for b in at.button if b.label == "Retire").click().run()
     with session_scope() as session:
         assert session.scalars(select(Tag)).one().retired is True
+
+
+# --- Health banner (SPEC.md section 9.2) ----------------------------------------------------
+
+
+def set_health(engine, **rows):
+    """Give each named source a row: name=dict(...) with SourceHealth columns."""
+    with session_scope() as session:
+        for source, values in rows.items():
+            session.add(SourceHealth(source=source, **values))
+
+
+def warnings(at: AppTest) -> str:
+    return " ".join(w.value for w in at.warning) + " ".join(e.value for e in at.error)
+
+
+def test_banner_is_quiet_when_the_worker_and_sources_are_healthy(app_env, engine):
+    now = datetime.now(tz=UTC)
+    set_health(engine, worker=dict(state=HealthState.OK, last_success_at=now),
+               odds_api=dict(state=HealthState.OK, last_success_at=now, quota_remaining=480))
+    assert warnings(run_main()) == ""
+
+
+def test_banner_warns_when_the_worker_has_never_run(app_env):
+    assert "never run" in warnings(run_main())
+
+
+def test_banner_warns_when_the_worker_has_stopped(app_env, engine):
+    set_health(engine, worker=dict(
+        state=HealthState.OK, last_success_at=datetime.now(tz=UTC) - timedelta(minutes=10)))
+    assert "last seen" in warnings(run_main())
+
+
+def test_banner_warns_when_credits_run_low(app_env, engine):
+    set_health(engine, worker=dict(state=HealthState.OK, last_success_at=datetime.now(tz=UTC)),
+               odds_api=dict(state=HealthState.OK, quota_remaining=57))
+    text = warnings(run_main())
+    assert "57 credits" in text and "50" in text
+
+
+def test_banner_names_a_source_that_has_been_failing(app_env, engine):
+    now = datetime.now(tz=UTC)
+    set_health(engine, worker=dict(state=HealthState.OK, last_success_at=now),
+               odds_api=dict(state=HealthState.OPEN, failure_kind=FailureKind.BLOCKED,
+                             open_until=now + timedelta(minutes=5),
+                             last_success_at=now - timedelta(hours=1)))
+    text = warnings(run_main())
+    assert "odds_api is failing (blocked)" in text
+
+
+def test_banner_says_when_the_data_format_changed(app_env, engine):
+    now = datetime.now(tz=UTC)
+    set_health(engine, worker=dict(state=HealthState.OK, last_success_at=now),
+               odds_api=dict(state=HealthState.OPEN, failure_kind=FailureKind.SCHEMA,
+                             open_until=now + timedelta(minutes=30)))
+    assert "the data format changed" in warnings(run_main())
