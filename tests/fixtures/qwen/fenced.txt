@@ -1,0 +1,5 @@
+Here is the slip you asked for:
+```json
+{"sportsbook_text": "DraftKings", "american_odds": -110, "legs": [{"event_text": "PHI @ CHI", "market_text": "Game Total", "line": 42.5, "american_odds": -110}]}
+```
+Let me know if you need anything else.

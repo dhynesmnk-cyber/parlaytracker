@@ -1,0 +1,3 @@
+{"sportsbook_text": ["DraftKings"], "slip_type_text": null, "american_odds": "even", "stake": {"amount": 10}, "unknown_field": 1,
+ "legs": [{"sport": "NFL", "event_text": "ARI @ SF", "player_name": "Trey McBride", "market_text": "Receptions", "line": "five and a half", "american_odds": 110.5},
+          "not a leg", null, {"sport": null, "event_text": null, "team_text": null, "player_name": null, "market_text": null, "line": null, "american_odds": null}]}

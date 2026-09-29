@@ -1,0 +1,5 @@
+{"sportsbook_text": "FanDuel Sportsbook", "slip_type_text": "Same Game Parlay", "american_odds": 645, "stake": 5.0, "potential_payout": 37.25,
+ "legs": [
+  {"sport": "NFL", "event_text": "Cardinals @ 49ers", "team_text": null, "player_name": "Trey McBride", "market_text": "Receptions", "line": 5.5, "american_odds": null},
+  {"sport": "NFL", "event_text": "Cardinals @ 49ers", "team_text": null, "player_name": null, "market_text": "Total Points", "line": 60.5, "american_odds": null},
+  {"sport": "NFL", "event_text": "Cardinals @ 49ers", "team_text": "49ers", "player_name": null, "market_text": "Alt Spread", "line": -3.5, "american_odds": null}]}
