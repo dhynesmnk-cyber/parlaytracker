@@ -93,7 +93,7 @@ For the next agent picking up ParlayTracker. Read [SPEC.md](SPEC.md) first: it i
     - A stake on the slip pre-ticks "I placed this bet" (a screenshot of a bet with a stake is usually placed): check it.
     - Each image is read **once** (sha256 in session state), not on every rerun; after Save the uploader and form start fresh.
     - **The SDK ships its own HTTP library** (`httpx2`), so `respx` can't intercept it. Tests give the real client a mock transport and assert the mock was reached; `tests/unit/test_extraction.py` verifies the actual wire request (URL, bearer header, body, 45 s timeout).
-24. **Dependencies:** each phase adds its own. Phase 3 added `apscheduler<4` and `rapidfuzz`, Phase 4 `nflreadpy` (which brings polars, pandas and pyarrow: the image is larger), Phase 6 `openai` and `Pillow`; later phases need `pandas`, `plotly`, `Pillow`, `openai` and `nflreadpy`.
+24. **Dependencies:** each phase adds its own. Phase 3 added `apscheduler<4` and `rapidfuzz`, Phase 4 `nflreadpy` (which brings polars, pandas and pyarrow: the image is larger), Phase 6 `openai` (3.x: it ships its own HTTP library, `httpx2`) and `Pillow`, plus `pandas` declared explicitly (Phase 5 imported it without declaring it). `tests/unit/test_dependencies.py` fails if the application imports anything `pyproject.toml` doesn't declare: PR #7's first CI run failed because `openai` was installed locally but not declared, and it would have broken the Screenshot page in the image; later phases need `pandas`, `plotly`, `Pillow`, `openai` and `nflreadpy`.
 
 ## Gotchas
 
