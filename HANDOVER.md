@@ -6,8 +6,8 @@ For the next agent picking up ParlayTracker. Read [SPEC.md](SPEC.md) first: it i
 
 | | |
 |---|---|
-| Code | All on `main`. Phases 0–2 were merged in [dhynesmnk-cyber/parlaytracker#4](https://github.com/dhynesmnk-cyber/parlaytracker/pull/4). Work on a branch, and open a PR into `main`: the laptop deploys whatever is merged there |
-| Done | Phases 0, 1 and 5 (SPEC.md section 13), and the **code** for Phases 2, 3 and 4. Phases 3, 4 and 5 are on branch `claude/elegant-pasteur-0qqx5i`, not yet merged |
+| Code | All on `main`. Phases 0–2 were merged in [dhynesmnk-cyber/parlaytracker#4](https://github.com/dhynesmnk-cyber/parlaytracker/pull/4), Phases 3–5 in [dhynesmnk-cyber/parlaytracker#6](https://github.com/dhynesmnk-cyber/parlaytracker/pull/6). Work on a branch, and open a PR into `main`: the laptop deploys whatever is merged there |
+| Done | Phases 0, 1 and 5 (SPEC.md section 13), and the **code** for Phases 2, 3 and 4 |
 | Phase 2 still open | Its exit criteria need the real laptop: install it, log real slips from both phones over Tailscale, reboot, update, and restore a backup once (below) |
 | Phase 3 still open | Its exit criteria need a real game day with logged slips (below) |
 | Phase 4 still open | Its exit criteria need a real weekend of games (below) |
@@ -191,4 +191,6 @@ Never paste keys into chat.
   - the image built and the stack started in 40 s;
   - the web app answered on `127.0.0.1:8501` only, and the worker heartbeat appeared;
   - a backup (28 KB) restored a deleted row, and the app came back healthy.
-- Later commits only touch this file. Check the latest run on the PR is green before building on it.
+- **PR #6 (Phases 3–5)**, head `c9016fe`: [`test` and `deploy` both passed](https://github.com/dhynesmnk-cyber/parlaytracker/actions/runs/36502601316). `deploy` now builds the image with the Phase 3–4 dependencies (`apscheduler`, `rapidfuzz`, `nflreadpy` and its polars/pandas/pyarrow), so that is the check that the image still builds and the worker starts with all its jobs registered.
+- **Merging deploys.** The laptop follows `main` and updates within about 5 minutes of a merge. The first start after this merge runs the worker's new `canary` job, and the banner will name any provider it can't parse. Then follow "Phase 4, on a real weekend" under Next steps, starting with the backfill.
+- Check the latest run on the PR is green before building on it.
