@@ -284,7 +284,10 @@ class EspnRouter:
 
     def __init__(self, breakers: Breakers, limiter=None,
                  sample_sink: Callable[[SampleRecord], None] | None = None,
-                 record_event_ids: frozenset[str] | set[str] = frozenset()):
+                 record_event_ids: frozenset[str] | set[str] = frozenset(),
+                 default_max_wait: float = 0.0):
+        # A CLI run may wait for ESPN's one-request-per-2-seconds slots; the worker never does.
+        self._default_wait = default_max_wait
         self._breakers = breakers
         self._limiter = limiter or espn.LIMITER  # looked up now, so tests can swap it
         self._sink = sample_sink
@@ -355,6 +358,7 @@ class EspnRouter:
         errors: dict[str, str] = {}
         limited = False
         last_kind: FailureKind | None = None
+        max_wait = max(max_wait, self._default_wait)
         for provider in providers:
             if only is not None and provider is not only:
                 continue

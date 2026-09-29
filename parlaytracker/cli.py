@@ -3,6 +3,9 @@
     export-sample <id> <path>   write a saved raw response out as a test fixture
     backfill                    settle everything logged before the worker could (Phase 4)
     read-slip <image> [--save]  read a slip screenshot with Qwen; --save keeps the raw reply
+    import-slips <csv> --user <email> [--apply] [--include-doubtful]
+                                load transcribed slips; a dry run unless --apply
+    check-import <csv>          after backfill: do our results match the slips'?
     export-recording <event> <dir>  write a recorded game (RECORD_EVENT_IDS) out for replay
 """
 import argparse
@@ -45,6 +48,12 @@ def backfill(engine: Engine, router: EspnRouter, nflverse) -> int:
     touched.
     """
     finals = CheckFinals(engine, router)(force=True, backfill=True)
+    if finals.skipped:
+        # Settling now would flag a game "not final 8 hours after its start" that ESPN simply
+        # couldn't be asked about. Nothing has been settled or flagged: run it again.
+        print(f"{finals.skipped} game(s) not reachable on ESPN: nothing settled. Run the "
+              "backfill again in a few minutes.", file=sys.stderr)
+        return 1
     settled = Settle(engine, router)()
     verified = VerifyNfl(engine, nflverse)()
     print(f"games not yet reachable: {finals.skipped}")
@@ -101,6 +110,57 @@ def read_slip(extractor, image_path: Path, save: Path | None) -> int:
     return 0
 
 
+def import_slips(engine: Engine, path: Path, user: str, apply: bool, include_doubtful: bool,
+                 games_for=None, roster_for=None) -> int:
+    """Plan the CSV's slips against ESPN and, with `apply`, write the ones that are sound."""
+    from parlaytracker.ingest import espn, slip_import
+
+    wait = 30.0  # a run of requests may have to wait for ESPN's one-per-2-seconds slots
+    games_for = games_for or (lambda sport, day: espn.fetch_scoreboard(sport, day, wait).games)
+    roster_for = roster_for or (lambda sport, team: espn.fetch_roster(sport, team, wait))
+    try:
+        slips = slip_import.parse_csv(path.read_text())
+    except (OSError, slip_import.CsvError) as e:
+        print(f"can't read {path}: {e}", file=sys.stderr)
+        return 1
+    with Session(engine) as session:
+        plans = slip_import.plan_import(session, slips, games_for=games_for,
+                                        roster_for=roster_for)
+        print(slip_import.summarize(plans))
+        if not apply:
+            print("\ndry run: nothing was written. Add --apply to import the ok slips"
+                  + (" (and, with --include-doubtful, the doubtful ones)." if not include_doubtful
+                     else "."))
+            return 0
+        report = slip_import.apply_plans(session, plans, user, include_doubtful=include_doubtful)
+        session.commit()
+    print(f"\nimported {len(report.imported)} slip(s); skipped "
+          f"{len(report.skipped)}: {report.skipped or 'none'}")
+    return 0
+
+
+def check_import(engine: Engine, path: Path) -> int:
+    from parlaytracker.ingest import slip_import
+
+    try:
+        slips = slip_import.parse_csv(path.read_text())
+    except (OSError, slip_import.CsvError) as e:
+        print(f"can't read {path}: {e}", file=sys.stderr)
+        return 1
+    with Session(engine) as session:
+        report = slip_import.check_import(session, slips)
+    print(f"{report.slips} slips in the database; legs: {report.legs_agree} agree, "
+          f"{report.legs_pending} not settled yet, {report.legs_review} in Review; "
+          f"slips agreeing: {report.slips_agree}")
+    if report.not_imported:
+        print(f"not imported: {', '.join(report.not_imported)}")
+    for m in report.mismatches:
+        print(f"MISMATCH {m.slip_id}: {m.what}")
+    for note in report.payout_notes:
+        print(f"payout: {note}")
+    return 1 if report.mismatches else 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="parlaytracker.cli", description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -115,6 +175,13 @@ def main(argv: list[str] | None = None) -> int:
     read = commands.add_parser("read-slip", help="read a slip screenshot with Qwen")
     read.add_argument("image", type=Path)
     read.add_argument("--save", type=Path, help="write the raw model reply to this file")
+    imp = commands.add_parser("import-slips", help="load transcribed slips from a CSV")
+    imp.add_argument("csv", type=Path)
+    imp.add_argument("--user", required=True, help="the login the slips are logged under")
+    imp.add_argument("--apply", action="store_true", help="write them (default: dry run)")
+    imp.add_argument("--include-doubtful", action="store_true")
+    chk = commands.add_parser("check-import", help="compare settled results with a CSV")
+    chk.add_argument("csv", type=Path)
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -132,6 +199,10 @@ def main(argv: list[str] | None = None) -> int:
         return export_sample(engine, args.id, args.path)
     if args.command == "export-recording":
         return export_recording(engine, args.event, args.directory)
+    if args.command == "check-import":
+        return check_import(engine, args.csv)
+    if args.command == "import-slips":
+        return import_slips(engine, args.csv, args.user, args.apply, args.include_doubtful)
 
     lock_conn = engine.connect()  # the worker's lock: two writers would poll ESPN twice
     if not try_lock(lock_conn):
@@ -140,7 +211,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     breakers = Breakers(engine)
     breakers.load()
-    router = EspnRouter(breakers, sample_sink=sample_sink(engine))
+    router = EspnRouter(breakers, sample_sink=sample_sink(engine), default_max_wait=30.0)
     try:
         return backfill(engine, router, lambda: NflverseData(breakers))
     finally:

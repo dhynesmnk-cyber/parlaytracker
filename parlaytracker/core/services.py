@@ -44,8 +44,12 @@ class ServiceError(ValueError):
     """The slip is well-formed but refers to something missing or not allowed."""
 
 
-def create_slip(session: Session, data: SlipIn, logged_by: str) -> Slip:
-    """Insert a validated slip and its legs. Raises ServiceError for bad references."""
+def create_slip(session: Session, data: SlipIn, logged_by: str,
+                placed_at: datetime | None = None) -> Slip:
+    """Insert a validated slip and its legs. Raises ServiceError for bad references.
+
+    `placed_at` dates a slip that was placed before it was logged (an import); it is the
+    `created_at` the app otherwise sets to now."""
     if not logged_by:
         raise ServiceError("logged_by is required")
     if session.get(Sportsbook, data.sportsbook_id) is None:
@@ -78,6 +82,8 @@ def create_slip(session: Session, data: SlipIn, logged_by: str) -> Slip:
         source=data.source,
         notes=data.notes,
     )
+    if placed_at is not None:
+        slip.created_at = placed_at
     slip.legs = [
         Leg(
             event_id=leg.event_id,
