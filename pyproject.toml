@@ -17,11 +17,15 @@ dependencies = [
     # Phase 2
     "httpx>=0.27",
     "streamlit>=1.42",
+    "pandas>=2",  # the Analytics page builds its tables with it (Phase 5)
     # Phase 3
     "apscheduler>=3.10,<4",
     "rapidfuzz>=3.6",
     # Phase 4
     "nflreadpy>=0.1.5",
+    # Phase 6. openai 3 ships its own HTTP library (httpx2); the wire tests rely on that.
+    "openai>=3,<4",
+    "Pillow>=10",
 ]
 
 [project.optional-dependencies]

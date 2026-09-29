@@ -2,7 +2,7 @@
 import streamlit as st
 
 from parlaytracker.app import auth, common
-from parlaytracker.app.pages import analytics, log, review, settings
+from parlaytracker.app.pages import analytics, log, review, screenshot, settings
 from parlaytracker.core import services
 from parlaytracker.core.db import session_scope
 
@@ -14,6 +14,7 @@ with session_scope() as session:
 
 pages = [
     st.Page(log.render, title="Log", icon="✍️", url_path="log", default=True),
+    st.Page(screenshot.render, title="Screenshot", icon="📷", url_path="screenshot"),
     st.Page(analytics.render, title="Analytics", icon="📊", url_path="analytics"),
     st.Page(review.render, title=f"Review ({pending})" if pending else "Review", icon="✅",
             url_path="review"),

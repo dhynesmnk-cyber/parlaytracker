@@ -189,3 +189,65 @@ def test_backfill_refuses_to_run_beside_a_live_worker(engine, clean, monkeypatch
             worker.execute(text("SELECT pg_advisory_unlock_all()"))
             worker.commit()
     assert "stop it first" in capsys.readouterr().err
+
+
+# --- read-slip ------------------------------------------------------------------------------
+
+
+class _Reader:
+    def __init__(self, reply="{}", error=None):
+        self.last_reply, self._error = reply, error
+
+    def extract(self, image):
+        from parlaytracker.ingest.extraction import parse_reply
+
+        if self._error:
+            raise self._error
+        return parse_reply(self.last_reply)
+
+
+def _png(tmp_path):
+    import io
+
+    from PIL import Image
+    path = tmp_path / "slip.png"
+    buffer = io.BytesIO()
+    Image.new("RGB", (100, 100), "white").save(buffer, "PNG")
+    path.write_bytes(buffer.getvalue())
+    return path
+
+
+def test_read_slip_prints_what_was_read_and_saves_the_raw_reply(tmp_path, capsys):
+    reply = '{"sportsbook_text": "DraftKings", "american_odds": -110}'
+    target = tmp_path / "real_01.json"
+    assert cli.read_slip(_Reader(reply), _png(tmp_path), target) == 0
+    out = capsys.readouterr().out
+    assert '"sportsbook_text": "DraftKings"' in out and "check it for anything private" in out
+    assert target.read_text() == reply  # the raw reply, not a re-serialisation
+
+
+def test_read_slip_without_save_writes_nothing(tmp_path, capsys):
+    assert cli.read_slip(_Reader('{"american_odds": 150}'), _png(tmp_path), None) == 0
+    assert list(tmp_path.glob("*.json")) == []
+
+
+def test_read_slip_reports_a_bad_file_or_a_failed_read(tmp_path, capsys):
+    from parlaytracker.ingest.extraction import ExtractionError
+    assert cli.read_slip(_Reader(), tmp_path / "missing.png", None) == 1
+    (tmp_path / "text.png").write_text("not an image")
+    assert cli.read_slip(_Reader(), tmp_path / "text.png", None) == 1
+    assert cli.read_slip(_Reader(error=ExtractionError("no")), _png(tmp_path), None) == 1
+    assert capsys.readouterr().err.count("couldn't read") == 3
+
+
+def test_read_slip_needs_a_key(monkeypatch, tmp_path, capsys):
+    monkeypatch.setenv("DATABASE_URL", "postgresql://x/y")
+    monkeypatch.setenv("DISPLAY_TZ", "Europe/London")
+    monkeypatch.delenv("QWEN_API_KEY", raising=False)
+    from parlaytracker.core.config import get_settings
+    get_settings.cache_clear()
+    try:
+        assert cli.main(["read-slip", str(_png(tmp_path))]) == 1
+    finally:
+        get_settings.cache_clear()
+    assert "QWEN_API_KEY is not set" in capsys.readouterr().err
