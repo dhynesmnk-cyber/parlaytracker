@@ -119,6 +119,10 @@ def resolve_sport(text: str | None) -> Sport | None:
 # Checked in order: the first pattern that matches wins, so specific wording comes first.
 _MARKET_PATTERNS: list[tuple[re.Pattern[str], MarketType]] = [(re.compile(p), m) for p, m in [
     (r"\bteam (total|points)\b", MarketType.TEAM_TOTAL),
+    (r"\bcompletions?\b|\bcmp\b", MarketType.PLAYER_PASS_COMPLETIONS),
+    (r"\binterceptions?\b|\bints?\b", MarketType.PLAYER_INTERCEPTIONS),
+    (r"\bfield goals?\b|\bfgs?\b", MarketType.PLAYER_FIELD_GOALS),
+    (r"\btouchdowns?\b|\btds?\b", MarketType.PLAYER_TOUCHDOWNS),
     (r"\brec(eiving|eptions?)? ?(yd|yds|yards)\b|\breceiving\b", MarketType.PLAYER_RECEIVING_YARDS),
     (r"\breceptions?\b|\brecs?\b", MarketType.PLAYER_RECEPTIONS),
     (r"\brush(ing)? ?(yd|yds|yards)\b|\brushing\b", MarketType.PLAYER_RUSHING_YARDS),
@@ -127,6 +131,10 @@ _MARKET_PATTERNS: list[tuple[re.Pattern[str], MarketType]] = [(re.compile(p), m)
     (r"\b(game total|total points|total|over under|o u)\b", MarketType.GAME_TOTAL),
     (r"\bpoints?\b|\bpts\b", MarketType.PLAYER_POINTS),
 ]]
+# A touchdown market that is not "any touchdown but a passing one": settled by hand.
+_OTHER_TD = re.compile(
+    r"\b(pass(ing)?|first|last|1st|2nd|2 ?pt|two point)\b.*\b(td|tds|touchdowns?)\b"
+    r"|\b(td|tds|touchdowns?)\b.*\b(first|last|1st)\b")
 _UNDER = re.compile(r"\bunder\b|\bu ?\d")
 _OVER_UNDER = re.compile(r"\bover under\b|\bo u\b")
 _SPORT_BY_MARKET_WORD = {"puck line": Sport.NHL, "run line": Sport.MLB}
@@ -145,7 +153,7 @@ def resolve_market(text: str | None, sport: Sport, has_player: bool) -> Resolved
     if not norm:
         return ResolvedMarket(MarketType.OTHER, doubtful=True)
     norm = _OVER_UNDER.sub("total", norm)  # "Over/Under" names the market, it isn't an Under
-    if _UNDER.search(norm):
+    if _UNDER.search(norm) or _OTHER_TD.search(norm):
         return ResolvedMarket(MarketType.OTHER)
     for pattern, market in _MARKET_PATTERNS:
         if pattern.search(norm):
@@ -157,12 +165,28 @@ def resolve_market(text: str | None, sport: Sport, has_player: bool) -> Resolved
     return ResolvedMarket(MarketType.OTHER)
 
 
+_ANYTIME = re.compile(r"\bany ?time\b")
+_LADDER = re.compile(r"(\d+)\+")
+
+
+def implied_line(market_text: str | None, line: float | None) -> Decimal | None:
+    """The Over line a slip means. "Anytime TD" prints no line (Over 0.5), and a ladder such as
+    "To Record 65+ Rushing Yards" or "To Score 2+ TDs" means Over one half less than the number."""
+    text = (market_text or "").lower()
+    if match := _LADDER.search(text):
+        return Decimal(match.group(1)) - Decimal("0.5")
+    if line is None and _ANYTIME.search(normalize_name(text)):
+        return Decimal("0.5")
+    return _line(line)
+
+
 def market_sport_hint(text: str | None) -> Sport | None:
     norm = normalize_name(text or "")
     for phrase, sport in _SPORT_BY_MARKET_WORD.items():
         if phrase in norm:
             return sport
-    if re.search(r"\brec(eiving|eptions?)?\b|\brush(ing)?\b|\bpass(ing)? (yd|yds|yards)\b", norm):
+    if re.search(r"\brec(eiving|eptions?)?\b|\brush(ing)?\b|\bpass(ing)? (yd|yds|yards)\b"
+                 r"|\bcompletions?\b|\bfield goals?\b|\binterceptions?\b|\bany ?time td\b", norm):
         return Sport.NFL
     return None
 
@@ -384,7 +408,7 @@ def resolve_slip(
         if market is MarketType.OTHER:
             description = _describe(leg)
         else:
-            line = _line(leg.line)
+            line = implied_line(leg.market_text, leg.line)
             if line is None or (line * 2) % 1 != 0:
                 doubts.add("line")
             if market.value.startswith("player_"):

@@ -18,19 +18,24 @@ log = logging.getLogger("parlaytracker.nflverse")
 
 SOURCE = "nflverse"
 
-# Which weekly-stats column settles which market.
-STAT_COLUMNS: dict[MarketType, str] = {
-    MarketType.PLAYER_RECEPTIONS: "receptions",
-    MarketType.PLAYER_RECEIVING_YARDS: "receiving_yards",
-    MarketType.PLAYER_RUSHING_YARDS: "rushing_yards",
-    MarketType.PLAYER_PASSING_YARDS: "passing_yards",
+# Which weekly-stats columns settle which market (summed when there are several). Column names
+# checked against nflreadpy's 2025 player_stats.
+STAT_COLUMNS: dict[MarketType, tuple[str, ...]] = {
+    MarketType.PLAYER_RECEPTIONS: ("receptions",),
+    MarketType.PLAYER_RECEIVING_YARDS: ("receiving_yards",),
+    MarketType.PLAYER_RUSHING_YARDS: ("rushing_yards",),
+    MarketType.PLAYER_PASSING_YARDS: ("passing_yards",),
+    MarketType.PLAYER_PASS_COMPLETIONS: ("completions",),
+    MarketType.PLAYER_INTERCEPTIONS: ("passing_interceptions",),
+    MarketType.PLAYER_FIELD_GOALS: ("fg_made",),
+    MarketType.PLAYER_TOUCHDOWNS: ("rushing_tds", "receiving_tds", "special_teams_tds", "def_tds"),
 }
 
 # The columns each dataset must have; a missing one is a format change (`schema`).
 REQUIRED_COLUMNS: dict[str, set[str]] = {
     "schedules": {"game_id", "espn", "home_score", "away_score", "overtime"},
     "players": {"gsis_id", "pfr_id", "espn_id"},
-    "player_stats": {"player_id", "game_id", *STAT_COLUMNS.values()},
+    "player_stats": {"player_id", "game_id", *(c for cols in STAT_COLUMNS.values() for c in cols)},
     "snap_counts": {"game_id", "pfr_player_id", "offense_snaps"},
 }
 
@@ -137,10 +142,13 @@ class NflverseData:
             return None
         row = self._index("player_stats", season, ("game_id", "player_id")).get(
             (game["game_id"], player["gsis_id"]))
-        value = None if row is None else row.get(STAT_COLUMNS[market])
-        if value is None or value != value:  # None or NaN
+        if row is None:
             return None
-        return Decimal(str(value))
+        # A column that is empty (None or NaN) for this player counts as 0, but a line with
+        # every column empty is no stat line at all.
+        values = [row.get(c) for c in STAT_COLUMNS[market]]
+        present = [v for v in values if v is not None and v == v]
+        return Decimal(str(sum(present))) if present else None
 
     def offense_snaps(self, season: int, espn_event_id: str,
                       espn_athlete_id: str) -> float | None:

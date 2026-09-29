@@ -87,7 +87,8 @@ def test_market_wording(text, sport, player, market):
     ("Under 5.5 Receptions", Sport.NFL, True),
     ("u44.5", Sport.NFL, False),
     ("Moneyline", Sport.NFL, False),
-    ("Anytime Touchdown Scorer", Sport.NFL, True),
+    ("First Touchdown Scorer", Sport.NFL, True),
+    ("Passing Touchdowns", Sport.NFL, True),        # a passing TD is not the TD market
     ("Rec Yds", Sport.NBA, True),                    # not a market that sport has
     ("Points", Sport.NFL, True),                     # player points exist for NBA and NHL only
     ("Points", Sport.NBA, False),                    # "points" with no player isn't a prop
@@ -450,3 +451,45 @@ def test_one_days_scoreboard_failing_does_not_hide_the_others():
 
     (leg,) = resolve_reply("fenced.txt", day=SUNDAY, games=flaky).legs
     assert leg.game.espn_event_id == PHI_CHI.espn_event_id
+
+
+# --- The four markets added after the first real slips ---------------------------------------
+
+
+@pytest.mark.parametrize(("text", "market"), [
+    ("PASS COMPLETIONS", M.PLAYER_PASS_COMPLETIONS),
+    ("Passing Completions", M.PLAYER_PASS_COMPLETIONS),      # "passing" must not read as yards
+    ("Completions", M.PLAYER_PASS_COMPLETIONS),
+    ("INTERCEPTIONS", M.PLAYER_INTERCEPTIONS),
+    ("Passing Interceptions", M.PLAYER_INTERCEPTIONS),
+    ("FIELD GOALS MADE", M.PLAYER_FIELD_GOALS),
+    ("Field Goals", M.PLAYER_FIELD_GOALS),
+    ("ANYTIME TD", M.PLAYER_TOUCHDOWNS),
+    ("Anytime Touchdown Scorer", M.PLAYER_TOUCHDOWNS),
+    ("TO SCORE 2+ TDS", M.PLAYER_TOUCHDOWNS),
+    ("Player Touchdowns", M.PLAYER_TOUCHDOWNS),
+    ("TO RECORD 65+ RUSHING YARDS", M.PLAYER_RUSHING_YARDS),  # still yards
+])
+def test_the_new_markets_resolve_from_the_wording_hard_rock_prints(text, market):
+    assert resolve.resolve_market(text, Sport.NFL, True) == resolve.ResolvedMarket(market)
+
+
+@pytest.mark.parametrize("text", [
+    "Passing Touchdowns", "First TD Scorer", "Last Touchdown", "Under 1.5 Touchdowns",
+])
+def test_touchdown_wording_that_is_not_any_non_passing_td_is_other(text):
+    assert resolve.resolve_market(text, Sport.NFL, True) == resolve.ResolvedMarket(M.OTHER)
+
+
+@pytest.mark.parametrize(("market_text", "printed", "line"), [
+    ("ANYTIME TD", None, "0.5"),                       # no line printed: Over 0.5
+    ("Anytime Touchdown Scorer", None, "0.5"),
+    ("TO SCORE 2+ TDS", 2, "1.5"),                     # a ladder: one half less
+    ("TO RECORD 100+ RUSHING YARDS", 100, "99.5"),
+    ("TO RECORD 65+ RUSHING YARDS", 64.5, "64.5"),     # already the Over line: unchanged
+    ("Rushing Yards", 64.5, "64.5"),
+    ("Rushing Yards", None, None),
+])
+def test_the_line_a_slip_means(market_text, printed, line):
+    got = resolve.implied_line(market_text, printed)
+    assert got == (None if line is None else D(line))

@@ -251,6 +251,11 @@ class SampleRecord:
     body: str
 
 
+def other_score_provider(current: DataSource) -> DataSource:
+    """The provider a frozen-feed probe asks: the other scoreboard host (section 8.3)."""
+    return DataSource.ESPN_SITE if current is DataSource.ESPN_WEB else DataSource.ESPN_WEB
+
+
 class AllProvidersFailed(Exception):
     """Every ESPN provider was skipped or failed. `errors` says why, per provider."""
 
@@ -279,7 +284,10 @@ class EspnRouter:
 
     def __init__(self, breakers: Breakers, limiter=None,
                  sample_sink: Callable[[SampleRecord], None] | None = None,
-                 record_event_ids: frozenset[str] | set[str] = frozenset()):
+                 record_event_ids: frozenset[str] | set[str] = frozenset(),
+                 default_max_wait: float = 0.0):
+        # A CLI run may wait for ESPN's one-request-per-2-seconds slots; the worker never does.
+        self._default_wait = default_max_wait
         self._breakers = breakers
         self._limiter = limiter or espn.LIMITER  # looked up now, so tests can swap it
         self._sink = sample_sink
@@ -291,8 +299,10 @@ class EspnRouter:
 
     # --- public requests -------------------------------------------------------------------
 
-    def scoreboard(self, sport: Sport, day: date, max_wait: float = 0.0
-                   ) -> Routed[espn.ScoreboardResult]:
+    def scoreboard(self, sport: Sport, day: date, max_wait: float = 0.0, *,
+                   only: DataSource | None = None) -> Routed[espn.ScoreboardResult]:
+        """A day's scoreboard from the first working provider, or from `only` (the frozen-feed
+        probe asks the other provider, section 8.3)."""
         path = f"{espn.SPORT_PATHS[sport]}/scoreboard"
 
         def check(result: espn.ScoreboardResult) -> None:
@@ -304,7 +314,7 @@ class EspnRouter:
         return self._route(
             _SCORE_PROVIDERS, lambda p, w: self._get_site(p, path, params, w),
             lambda payload: espn.parse_scoreboard(sport, payload), check, max_wait,
-            recording_id=None, watch=self._record)
+            recording_id=None, watch=self._record, only=only)
 
     def box_score(self, sport: Sport, espn_event_id: str, max_wait: float = 0.0, *,
                   only: DataSource | None = None) -> Routed[espn.BoxScore]:
@@ -348,6 +358,7 @@ class EspnRouter:
         errors: dict[str, str] = {}
         limited = False
         last_kind: FailureKind | None = None
+        max_wait = max(max_wait, self._default_wait)
         for provider in providers:
             if only is not None and provider is not only:
                 continue
@@ -381,8 +392,10 @@ class EspnRouter:
                 errors[source] = f"{kind}: {e}"
                 continue
             self._breakers.success(source)
-            if recording_id in self._record or any(w in response.text for w in watch):
-                self._save(source, "recording", url, response, recording_id, None)
+            watched = recording_id if recording_id in self._record else next(
+                (w for w in sorted(watch) if w in response.text), None)
+            if watched is not None:  # tagged with the watched event, so a game can be exported
+                self._save(source, "recording", url, response, watched, None)
             return Routed(provider, value)
         if limited and last_kind is None:
             raise RateLimited("espn", 0.0)  # skipped, not failed: the next run tries again

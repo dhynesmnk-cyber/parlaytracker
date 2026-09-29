@@ -11,7 +11,7 @@ from decimal import Decimal
 from sqlalchemy import and_, func, select
 from sqlalchemy.orm import Session, selectinload
 
-from parlaytracker.core.markets import MARKET_SPORTS
+from parlaytracker.core.markets import MARKET_SPORTS, NO_AUTO_CLOSING
 from parlaytracker.core.models import (
     ClosingSource,
     DataSource,
@@ -44,8 +44,12 @@ class ServiceError(ValueError):
     """The slip is well-formed but refers to something missing or not allowed."""
 
 
-def create_slip(session: Session, data: SlipIn, logged_by: str) -> Slip:
-    """Insert a validated slip and its legs. Raises ServiceError for bad references."""
+def create_slip(session: Session, data: SlipIn, logged_by: str,
+                placed_at: datetime | None = None) -> Slip:
+    """Insert a validated slip and its legs. Raises ServiceError for bad references.
+
+    `placed_at` dates a slip that was placed before it was logged (an import); it is the
+    `created_at` the app otherwise sets to now."""
     if not logged_by:
         raise ServiceError("logged_by is required")
     if session.get(Sportsbook, data.sportsbook_id) is None:
@@ -78,6 +82,8 @@ def create_slip(session: Session, data: SlipIn, logged_by: str) -> Slip:
         source=data.source,
         notes=data.notes,
     )
+    if placed_at is not None:
+        slip.created_at = placed_at
     slip.legs = [
         Leg(
             event_id=leg.event_id,
@@ -420,6 +426,24 @@ def settle_leg_auto(session: Session, leg: Leg, *, final_value: Decimal, source:
     return refresh_slip(session, leg.slip, now)
 
 
+def set_live_value(session: Session, leg: Leg, value: Decimal | None, source: DataSource,
+                   now: datetime | None = None) -> Leg:
+    """Record what a leg stands at right now, for the Live page (section 9.4).
+
+    Display only: this never touches `result`, and it refuses a leg that has settled, so a
+    live value can never overwrite or stand in for a settlement (constraint 2).
+    """
+    if leg.result is not LegResult.PENDING:
+        raise ServiceError("a settled leg has no live value")
+    if source not in AUTO_SOURCES:
+        raise ServiceError(f"{source} is not an automatic source")
+    leg.live_value = value
+    leg.live_updated_at = now or _now()
+    leg.live_source = source
+    session.flush()
+    return leg
+
+
 def flag_leg(session: Session, leg: Leg, reason: str) -> Leg:
     """Send a leg to Review. Idempotent: an existing flag keeps its original reason."""
     if not leg.needs_review:
@@ -463,7 +487,7 @@ def review_queue(session: Session, now: datetime | None = None) -> list[ReviewIt
     awaiting = and_(Leg.result == LegResult.PENDING,
                     Event.start_time <= now - AWAITING_RESULT_AFTER)
     no_closing = and_(
-        Leg.closing_captured_at.is_(None), Leg.market_type != MarketType.OTHER,
+        Leg.closing_captured_at.is_(None), Leg.market_type.notin_(NO_AUTO_CLOSING),
         Event.start_time <= now, Event.start_time > now - CLOSING_LINE_WINDOW,
     )
     legs = session.scalars(
@@ -488,7 +512,7 @@ def review_queue(session: Session, now: datetime | None = None) -> list[ReviewIt
         ReviewItem("closing_line", "No closing line was captured: enter it if you can",
                    leg.slip, leg)
         for leg in legs
-        if leg.closing_captured_at is None and leg.market_type is not MarketType.OTHER
+        if leg.closing_captured_at is None and leg.market_type not in NO_AUTO_CLOSING
         and now - CLOSING_LINE_WINDOW < leg.event.start_time <= now
     ]
     return items

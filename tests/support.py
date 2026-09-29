@@ -167,3 +167,181 @@ def analytics_leg(result=None, odds=-110, line="45.5", **kw):
         logged_by="a@example.com", line=Decimal(line), odds=odds,
         result=result or LegResult.WIN)
     return LegRow(**{**defaults, **kw})
+
+
+# --- Live tracking ----------------------------------------------------------------------------
+
+
+class LiveRouter:
+    """A scoreboard and box-score source for `poll_nfl_live`, with a per-provider feed so a test
+    can freeze one, block one, or advance both. It keeps the real router's contract: the first
+    provider whose breaker is open is skipped, a failing one is recorded on the breaker, and
+    `only=` asks one provider."""
+
+    ORDER = (DataSource.ESPN_WEB, DataSource.ESPN_SITE)
+
+    def __init__(self, breakers=None):
+        from parlaytracker.ingest.router import Breakers
+
+        self.breakers = breakers or Breakers(engine=None)
+        # provider -> day -> ScoreboardResult, and provider -> event id -> BoxScore
+        self.boards: dict[DataSource, dict] = {p: {} for p in self.ORDER}
+        self.boxes: dict[DataSource, dict] = {p: {} for p in (*self.ORDER, DataSource.ESPN_CDN)}
+        self.down: set[DataSource] = set()
+        self.calls: list[tuple] = []
+
+    def _fail(self, provider):
+        from parlaytracker.core.models import FailureKind
+        self.breakers.failure(provider.value, FailureKind.BLOCKED, "403")
+
+    def scoreboard(self, sport, day, max_wait=0.0, *, only=None):
+        from parlaytracker.ingest.router import ProviderOpen
+        errors = {}
+        for provider in ([only] if only else self.ORDER):
+            try:
+                self.breakers.allow(provider.value)
+            except ProviderOpen as e:
+                errors[provider.value] = str(e)
+                continue
+            self.calls.append(("board", provider, day))
+            if provider in self.down:
+                self._fail(provider)
+                errors[provider.value] = "blocked"
+                continue
+            self.breakers.success(provider.value)
+            return Routed(provider, self.boards[provider][day])
+        raise AllProvidersFailed(errors)
+
+    def box_score(self, sport, espn_event_id, max_wait=0.0, *, only=None):
+        from parlaytracker.ingest.router import ProviderOpen
+        errors = {}
+        for provider in ([only] if only else list(self.boxes)):
+            try:
+                self.breakers.allow(provider.value)
+            except ProviderOpen as e:
+                errors[provider.value] = str(e)
+                continue
+            self.calls.append(("box", provider, espn_event_id))
+            if provider in self.down:
+                self._fail(provider)
+                errors[provider.value] = "blocked"
+                continue
+            self.breakers.success(provider.value)
+            return Routed(provider, self.boxes[provider][espn_event_id])
+        raise AllProvidersFailed(errors)
+
+    def count(self, kind: str) -> int:
+        return sum(1 for c in self.calls if c[0] == kind)
+
+    def serve(self, day, game_or_games, providers=None):
+        """Both (or the given) providers answer this day's scoreboard with these games."""
+        games = game_or_games if isinstance(game_or_games, list) else [game_or_games]
+        for p in providers or self.ORDER:
+            self.boards[p][day] = espn.ScoreboardResult(list(games), {})
+
+
+def live_game(status=EventStatus.IN_PROGRESS, period=1, clock=900, home=0, away=0,
+              espn_id=ARI_SF, start=KICKOFF):
+    """A scoreboard game for ARI @ SF at a given moment."""
+    return espn.Game(
+        espn_event_id=espn_id, sport=Sport.NFL, start_time=start, status=status,
+        status_detail="", period=period, clock_seconds=clock,
+        home=espn.Team("25", "SF", "San Francisco 49ers"),
+        away=espn.Team("22", "ARI", "Arizona Cardinals"), home_score=home, away_score=away)
+
+
+# Frames for the live simulations: the real scoreboard and box-score JSON, edited to a moment
+# in a game. Synthetic timelines built from real documents (not a recording of a live game).
+
+_STATUS_TYPES = {
+    EventStatus.SCHEDULED: ("STATUS_SCHEDULED", "pre", False),
+    EventStatus.IN_PROGRESS: ("STATUS_IN_PROGRESS", "in", False),
+    EventStatus.BREAK: ("STATUS_HALFTIME", "in", False),
+    EventStatus.DELAYED: ("STATUS_DELAYED", "in", False),
+    EventStatus.FINAL: ("STATUS_FINAL", "post", True),
+}
+
+
+def scoreboard_json(base: dict, status: EventStatus, period: int, clock: float, home: int,
+                    away: int, event_id: str = ARI_SF, others: EventStatus | None = None) -> dict:
+    """`base` (a real scoreboard) with `event_id` moved to a moment; `others` sets every other
+    game to one status too (a whole slate in play)."""
+    import copy
+
+    payload = copy.deepcopy(base)
+    for event in payload["events"]:
+        mine = event["id"] == event_id
+        wanted = status if mine else others
+        if wanted is None:
+            continue
+        name, state, completed = _STATUS_TYPES[wanted]
+        event["status"] = {
+            "clock": float(clock), "displayClock": f"{int(clock) // 60}:{int(clock) % 60:02d}",
+            "period": period,
+            "type": {"id": "2", "name": name, "state": state, "completed": completed,
+                     "description": name, "detail": name, "shortDetail": name}}
+        for side in event["competitions"][0]["competitors"]:
+            side["score"] = str(home if side["homeAway"] == "home" else away)
+    return payload
+
+
+def box_json(receptions: int) -> dict:
+    """The real ARI @ SF box score with Trey McBride at `receptions` catches."""
+    import copy
+
+    doc = copy.deepcopy(load("espn", "nfl_summary_401872958_final.json"))
+    for team in doc["boxscore"]["players"]:
+        for group in team["statistics"]:
+            if group.get("name") == "receiving":
+                for a in group["athletes"]:
+                    if a["athlete"]["id"] == MCBRIDE:
+                        a["stats"][group["keys"].index("receptions")] = str(receptions)
+    return doc
+
+
+class SimClock:
+    """One fake clock for the breakers, the rate limiter and the job's ticks."""
+
+    def __init__(self, start: datetime, tick_seconds: float = 30.0):
+        self.start, self.now, self.tick_seconds = start, start, tick_seconds
+
+    def monotonic(self) -> float:
+        return (self.now - self.start).total_seconds()
+
+    def sleep(self, seconds: float) -> None:
+        from datetime import timedelta
+        self.now += timedelta(seconds=seconds)
+
+
+class RecordingRouter:
+    """Replays a game exported by `cli export-recording`: each call gets the next response that
+    was recorded for that kind of request, and the last one again once they run out. The job
+    makes the same calls at the same ticks as when it was recorded, so they line up."""
+
+    def __init__(self, directory):
+        from pathlib import Path
+
+        self.breakers = None  # a replay has no providers to break
+        root = Path(directory)
+        self._frames = {"scoreboard": [], "summary": []}
+        for entry in json.loads((root / "index.json").read_text()):
+            self._frames[entry["kind"]].append(
+                (entry["source"], json.loads((root / entry["file"]).read_text())))
+        self._next = {"scoreboard": 0, "summary": 0}
+        self.calls: list[tuple] = []
+
+    def _take(self, kind):
+        frames = self._frames[kind]
+        source, payload = frames[min(self._next[kind], len(frames) - 1)]
+        self._next[kind] += 1
+        return DataSource(source), payload
+
+    def scoreboard(self, sport, day, max_wait=0.0, *, only=None):
+        self.calls.append(("board", day))
+        provider, payload = self._take("scoreboard")
+        return Routed(provider, espn.parse_scoreboard(sport, payload))
+
+    def box_score(self, sport, espn_event_id, max_wait=0.0, *, only=None):
+        self.calls.append(("box", espn_event_id))
+        provider, payload = self._take("summary")
+        return Routed(provider, espn.parse_box_score(sport, payload))

@@ -82,6 +82,7 @@ Then open the app and check your slips are all there.
 | Change a setting | Edit `/opt/parlaytracker/.env`, then `sudo /opt/parlaytracker/deploy/compose.sh up -d` |
 | Add a user | Invite them to the tailnet, add their login to `ALLOWED_LOGINS`, then `compose.sh up -d` |
 | Settle old games once (after the first install, or a long outage) | `compose.sh stop worker`, then `compose.sh run --rm worker python -m parlaytracker.cli backfill`, then `compose.sh start worker` |
+| Load slips from a CSV, then check their results | `compose.sh stop worker`; `compose.sh run --rm -T worker python -m parlaytracker.cli import-slips - --user <login> < slips.csv` (a dry run; add `--apply` to write); `... cli backfill`; `compose.sh start worker`; `... cli check-import - < slips.csv`. Keep the CSV out of the repo |
 | Save a raw ESPN/Odds response as a test fixture | `compose.sh run --rm worker python -m parlaytracker.cli export-sample <id> /tmp/sample.json` |
 
 **If the laptop is off or offline during games:**

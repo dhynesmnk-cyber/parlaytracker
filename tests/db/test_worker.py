@@ -101,7 +101,8 @@ def test_the_scheduler_registers_the_jobs_with_the_spec_defaults(engine):
     breakers = Breakers(engine)
     scheduler = build_scheduler(engine, breakers, OddsApiClient("k", breakers), reserve=50)
     assert {j.id for j in scheduler.get_jobs()} == {
-        "heartbeat", "capture_closing", "check_finals", "settle", "recheck_settled",
+        "heartbeat", "capture_closing", "poll_nfl_live", "check_finals", "settle",
+        "recheck_settled",
         "verify_nfl", "canary", "canary_at_startup", "prune_samples"}
     # Jobs added before start() are pending; the defaults apply to each when it is scheduled.
     assert scheduler._job_defaults == {"coalesce": True, "max_instances": 1,
@@ -110,7 +111,8 @@ def test_the_scheduler_registers_the_jobs_with_the_spec_defaults(engine):
              if hasattr(j.trigger, "interval")}
     assert every == {
         "heartbeat": timedelta(seconds=60), "capture_closing": timedelta(seconds=60),
-        "check_finals": timedelta(minutes=15), "settle": timedelta(minutes=5),
+        "poll_nfl_live": timedelta(seconds=30), "check_finals": timedelta(minutes=15),
+        "settle": timedelta(minutes=5),
         "recheck_settled": timedelta(hours=1)}
     daily = {j.id: str(j.trigger) for j in scheduler.get_jobs() if j.id not in every
              and j.id != "canary_at_startup"}
