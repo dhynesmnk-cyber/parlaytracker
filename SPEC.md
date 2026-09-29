@@ -45,6 +45,10 @@ Sports: NFL, NBA, MLB, NHL.
 | `player_receiving_yards` | NFL | Receiving yards |
 | `player_rushing_yards` | NFL | Rushing yards |
 | `player_passing_yards` | NFL | Passing yards |
+| `player_pass_completions` | NFL | Pass completions |
+| `player_touchdowns` | NFL | Rushing + receiving + kick and punt return + defensive touchdowns; never a passing one. "Anytime TD" is Over 0.5, "2+ TDs" Over 1.5 |
+| `player_interceptions` | NFL | Interceptions thrown by the player |
+| `player_field_goals` | NFL | Field goals made |
 | `player_points` | NBA, NHL | NBA: points. NHL: goals + assists |
 | `other` | any | Manual settlement only |
 
@@ -217,6 +221,10 @@ class MarketType(enum.StrEnum):
     PLAYER_RECEIVING_YARDS = "player_receiving_yards"
     PLAYER_RUSHING_YARDS = "player_rushing_yards"
     PLAYER_PASSING_YARDS = "player_passing_yards"
+    PLAYER_PASS_COMPLETIONS = "player_pass_completions"
+    PLAYER_TOUCHDOWNS = "player_touchdowns"  # rushing + receiving + returns, never passing
+    PLAYER_INTERCEPTIONS = "player_interceptions"  # thrown by a quarterback
+    PLAYER_FIELD_GOALS = "player_field_goals"  # made
     PLAYER_POINTS = "player_points"
     OTHER = "other"  # out-of-scope parlay leg (Under, moneyline): manual settle, not analysed
 
@@ -685,6 +693,10 @@ Stat mapping (verified against real box scores, 2026-09-28):
 | `player_receiving_yards` | `receiving` | `receivingYards` |
 | `player_rushing_yards` | `rushing` | `rushingYards` |
 | `player_passing_yards` | `passing` | `passingYards` |
+| `player_pass_completions` | `passing` | `completions/passingAttempts` ("38/52": the first number) |
+| `player_interceptions` | `passing` | `interceptions` |
+| `player_field_goals` | `kicking` | `fieldGoalsMade/fieldGoalAttempts` ("3/3": the first number) |
+| `player_touchdowns` | `rushing`, `receiving`, `kickReturns`, `puntReturns`, `defensive` | `rushingTouchdowns`, `receivingTouchdowns`, `kickReturnTouchdowns`, `puntReturnTouchdowns`, `defensiveTouchdowns`, added together |
 | `player_points` (NBA) | the single unnamed group | `points` |
 | `player_points` (NHL) | `forwards` and `defenses` | `goals` + `assists` (there is no points column) |
 
@@ -724,6 +736,8 @@ Market keys, kept in one dict in `resolve.py`. All NFL keys were verified with o
 | `player_rushing_yards` | `player_rush_yds` | `player_rush_yds_alternate` |
 | `player_passing_yards` | `player_pass_yds` | `player_pass_yds_alternate` |
 | `player_points` | `player_points` | `player_points_alternate` |
+
+The four markets added on 2026-09-29 (pass completions, touchdowns, interceptions, field goals) have **no key here yet**: The Odds API's names for them have not been checked against a real game, and one wrong key gets the whole request rejected. Their legs get no automatic closing line (`NO_AUTO_CLOSING` in `core/markets.py`) and no "missing closing line" review item; a closing line can still be entered by hand. Verify the keys on a real game (candidates: `player_pass_completions`, `player_pass_interceptions`, `player_field_goals`, and for touchdowns `player_anytime_td` / `player_tds_over`) and then add them to the dict.
 
 Matching:
 - **Events:** resolve `odds_api_event_id` once, using `/v4/sports/{sport_key}/events`. Both team names must match through the team alias table, and `commence_time` must be within 3 hours of `start_time`. Cache the ID on `events`.

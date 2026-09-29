@@ -334,3 +334,16 @@ def test_two_games_are_captured_independently(engine, job):
     assert capture(NOW) == 1  # the second game isn't in the API's list
     first, second = legs_of(engine)
     assert first.closing_captured_at is not None and second.closing_captured_at is None
+
+
+def test_legs_in_markets_without_a_verified_odds_api_key_cost_no_credits(engine, job):
+    """A wrong market key would get the whole request rejected, so these are never asked for;
+    the game total beside them is still captured with one call and one credit."""
+    capture, odds = job
+    new_markets = [
+        {"market_type": m, "espn_athlete_id": "4241478", "line": "1.5"}
+        for m in ("player_touchdowns", "player_pass_completions", "player_interceptions",
+                  "player_field_goals")]
+    commit(engine, lambda s: add_slip(s, add_event(s), [total("42.5"), *new_markets]))
+    assert capture(NOW) == 1
+    assert odds.odds_calls == [("odds", GAME, ["totals"])]
