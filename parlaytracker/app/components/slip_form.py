@@ -1,8 +1,11 @@
-"""The one slip form, used by Log now and by Screenshot in Phase 6 (SPEC.md section 9.3).
+"""The one slip form, used by Log and by Screenshot (SPEC.md sections 9.3 and 9.6).
 
 Widget values live in st.session_state under per-leg keys. Defaults for new widgets are kept
 under separate `*_default` keys, so the code never writes to a widget's own key once it
 exists. Saving runs in a button callback: it can then reset the form before the next run.
+
+`prefill` fills this same form from a resolved screenshot and marks the fields the resolver
+was unsure of. It must run before the form's widgets are drawn in that run.
 """
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
@@ -30,9 +33,12 @@ from parlaytracker.ingest.http import FetchError, RateLimited
 
 PLAYER_MARKETS = {m for m in MarketType if m.value.startswith("player_")}
 TEAM_MARKETS = {MarketType.TEAM_TOTAL, MarketType.ALT_SPREAD}
-SLIP_KEYS = ("slip_sgp", "slip_odds", "slip_placed", "slip_stake", "slip_payout",
-             "slip_boosted", "slip_notes")
-LEG_FIELDS = ("sport", "day", "game", "market", "player", "side", "desc", "line", "odds", "tags")
+SLIP_FIELDS = ("sgp", "odds", "placed", "stake", "payout", "boosted", "notes", "book")
+SLIP_KEYS = tuple(f"slip_{name}" for name in SLIP_FIELDS) + tuple(
+    f"slip_{name}_default" for name in SLIP_FIELDS) + ("slip_doubts",)
+LEG_FIELDS = ("sport", "day", "game", "market", "player", "side", "desc", "line", "odds", "tags",
+              "doubts")
+DOUBT_MARK = " ⚠ check"
 
 
 def _k(uid: int, name: str) -> str:
@@ -109,6 +115,11 @@ def _add_leg() -> None:
     _new_leg(st.session_state.get(_k(last, "sport"), Sport.NFL),
              st.session_state.get(_k(last, "day"), espn.today_game_day()),
              st.session_state.get(_k(last, "game")))
+
+
+def _flag(label: str, doubts: frozenset[str], name: str) -> str:
+    """A field label, marked when the screenshot reader wasn't sure of it."""
+    return label + DOUBT_MARK if name in doubts else label
 
 
 def _forget_leg(uid: int) -> None:
@@ -242,15 +253,58 @@ def _save(source: EntrySource) -> None:
         return
     st.session_state.pop("slip_errors", None)
     common.flash(f"Saved: {summary}")
+    st.session_state["slip_saved"] = True  # for the Screenshot page: this image is done
     first = drafts[0]
     st.session_state["last_sport"], st.session_state["last_day"] = first.sport, first.day
     st.session_state["last_game"] = first.game.espn_event_id if first.game else None
     st.session_state["last_book"] = st.session_state.get("slip_book")
-    for uid in list(st.session_state["slip_legs"]):
+    reset()
+
+
+def reset() -> None:
+    """Empty the form: every leg and every slip-level field back to its default."""
+    for uid in list(st.session_state.get("slip_legs", [])):
         _forget_leg(uid)
     st.session_state["slip_legs"] = []
     for key in SLIP_KEYS:
         st.session_state.pop(key, None)
+    st.session_state.pop("slip_errors", None)
+
+
+def prefill(slip) -> None:
+    """Fill the form from a `resolve.ResolvedSlip`, marking what the reader was unsure of.
+
+    Only defaults are written, never a widget's own key, so the form's normal rules still
+    apply and the person can change anything. Nothing is saved until they press Save.
+    """
+    reset()
+    ss = st.session_state
+    for leg in slip.legs:
+        uid = _new_leg(leg.sport, leg.day, leg.game.espn_event_id if leg.game else None)
+        ss[_k(uid, "market_default")] = leg.market
+        ss[_k(uid, "player_default")] = leg.athlete_id
+        ss[_k(uid, "side_default")] = leg.side
+        ss[_k(uid, "desc_default")] = leg.description
+        ss[_k(uid, "line_default")] = None if leg.line is None else float(leg.line)
+        ss[_k(uid, "odds_default")] = leg.odds
+        ss[_k(uid, "doubts")] = leg.doubts
+    ss["slip_book_default"] = slip.book_id
+    ss["slip_sgp_default"] = True if slip.sgp is None else slip.sgp
+    ss["slip_odds_default"] = slip.slip_odds
+    ss["slip_placed_default"] = slip.placed
+    ss["slip_stake_default"] = None if slip.stake is None else float(slip.stake)
+    ss["slip_payout_default"] = None if slip.payout is None else float(slip.payout)
+    ss["slip_doubts"] = slip.doubts
+    if slip.legs:
+        first = slip.legs[0]
+        ss["last_sport"], ss["last_day"] = first.sport, first.day
+
+
+def doubt_count() -> int:
+    """How many fields are currently marked, for the page's summary line."""
+    ss = st.session_state
+    return len(ss.get("slip_doubts", ())) + sum(
+        len(ss.get(_k(uid, "doubts"), ())) for uid in ss.get("slip_legs", []))
 
 
 # --- Rendering -----------------------------------------------------------------------------
@@ -258,6 +312,7 @@ def _save(source: EntrySource) -> None:
 
 def _render_leg(uid: int, n: int, removable: bool, tags: dict[int, str]) -> None:
     ss = st.session_state
+    doubts: frozenset[str] = ss.get(_k(uid, "doubts"), frozenset())
     with st.container(border=True):
         top = st.columns([3, 1]) if removable else [st.container()]
         top[0].markdown(f"**Leg {n}**")
@@ -265,7 +320,7 @@ def _render_leg(uid: int, n: int, removable: bool, tags: dict[int, str]) -> None
             top[1].button("Remove", key=_k(uid, "remove"), on_click=_remove_leg, args=(uid,))
         c1, c2 = st.columns(2)
         sports = list(Sport)
-        sport = c1.selectbox("Sport", sports, key=_k(uid, "sport"),
+        sport = c1.selectbox(_flag("Sport", doubts, "sport"), sports, key=_k(uid, "sport"),
                              index=sports.index(ss.get(_k(uid, "sport_default"), Sport.NFL)),
                              format_func=lambda s: s.value.upper())
         day = c2.date_input("Game day (US Eastern)", key=_k(uid, "day"),
@@ -276,12 +331,16 @@ def _render_leg(uid: int, n: int, removable: bool, tags: dict[int, str]) -> None
         by_id = {g.espn_event_id: g for g in games}
         default = ss.get(_k(uid, "game_default"))
         game_id = st.selectbox(
-            "Game", list(by_id), key=_k(uid, "game"),
+            _flag("Game", doubts, "game"), list(by_id), key=_k(uid, "game"),
             index=list(by_id).index(default) if default in by_id else None,
             format_func=lambda i: _game_label(by_id[i]), placeholder="Choose a game")
         game = by_id.get(game_id)
-        market = st.selectbox("Market", markets_for(sport), key=_k(uid, "market"),
-                              format_func=common.MARKET_LABELS.get)
+        market_options = markets_for(sport)
+        market_default = ss.get(_k(uid, "market_default"))
+        market = st.selectbox(
+            _flag("Market", doubts, "market"), market_options, key=_k(uid, "market"),
+            index=market_options.index(market_default) if market_default in market_options else 0,
+            format_func=common.MARKET_LABELS.get)
         if market in PLAYER_MARKETS:
             if game is None:
                 st.caption("Choose a game to pick a player.")
@@ -289,24 +348,32 @@ def _render_leg(uid: int, n: int, removable: bool, tags: dict[int, str]) -> None
                 players, problem = _players(sport, game)
                 if problem:
                     st.warning(problem)
-                st.selectbox("Player", list(players), key=_k(uid, "player"), index=None,
+                default = ss.get(_k(uid, "player_default"))
+                st.selectbox(_flag("Player", doubts, "player"), list(players),
+                             key=_k(uid, "player"),
+                             index=list(players).index(default) if default in players else None,
                              format_func=lambda i: players[i][1], placeholder="Type a name")
         elif market in TEAM_MARKETS:
             if game is None:
                 st.caption("Choose a game to pick a team.")
             else:
-                st.radio("Team", [TeamSide.AWAY, TeamSide.HOME], key=_k(uid, "side"),
-                         horizontal=True, index=None,
+                sides = [TeamSide.AWAY, TeamSide.HOME]
+                default = ss.get(_k(uid, "side_default"))
+                st.radio(_flag("Team", doubts, "side"), sides, key=_k(uid, "side"),
+                         horizontal=True, index=sides.index(default) if default in sides else None,
                          format_func=lambda s: game.away.name if s is TeamSide.AWAY
                          else game.home.name)
         elif market is MarketType.OTHER:
-            st.text_input("What was the pick? (e.g. Bears moneyline, Under 44.5)",
-                          key=_k(uid, "desc"))
+            st.text_input(_flag("What was the pick? (e.g. Bears moneyline, Under 44.5)", doubts,
+                                "market"),
+                          key=_k(uid, "desc"), value=ss.get(_k(uid, "desc_default")) or "")
         c1, c2 = st.columns(2)
         if market is not MarketType.OTHER:
             label = "Spread (e.g. -7.5)" if market is MarketType.ALT_SPREAD else "Over line"
-            c1.number_input(label, key=_k(uid, "line"), value=None, step=0.5, format="%.1f")
-        c2.number_input("Odds (American)", key=_k(uid, "odds"), value=None, step=1,
+            c1.number_input(_flag(label, doubts, "line"), key=_k(uid, "line"),
+                            value=ss.get(_k(uid, "line_default")), step=0.5, format="%.1f")
+        c2.number_input(_flag("Odds (American)", doubts, "odds"), key=_k(uid, "odds"),
+                        value=ss.get(_k(uid, "odds_default")), step=1,
                         format="%d", help="e.g. -110 or 150. Leave blank on a same-game "
                         "parlay leg if the slip doesn't show it.")
         if tags:
@@ -315,32 +382,39 @@ def _render_leg(uid: int, n: int, removable: bool, tags: dict[int, str]) -> None
 
 def _render_slip(drafts: list[LegDraft], books: dict[int, str]) -> SlipType:
     ss = st.session_state
+    doubts: frozenset[str] = ss.get("slip_doubts", frozenset())
     slip_type = SlipType.SINGLE
     if len(drafts) > 1:
         ids = {d.game.espn_event_id if d.game else None for d in drafts}
         if len(ids) == 1 and None not in ids:
-            st.toggle("Same-game parlay", value=True, key="slip_sgp")
+            st.toggle("Same-game parlay", value=ss.get("slip_sgp_default", True),
+                      key="slip_sgp")
         slip_type = _slip_type(drafts)
         if slip_type is SlipType.PARLAY:
             computed = _computed_parlay_odds(drafts)
             hint = (f"Leave blank to use the legs' {common.fmt_odds(computed)}"
                     if computed is not None else "Enter every leg's odds, or the slip's")
-            st.number_input("Slip odds as shown", key="slip_odds", value=None, step=1,
+            st.number_input(_flag("Slip odds as shown", doubts, "odds"), key="slip_odds",
+                            value=ss.get("slip_odds_default"), step=1,
                             format="%d", help=hint, placeholder=hint)
         else:
-            st.number_input("Slip odds as shown", key="slip_odds", value=None, step=1,
+            st.number_input(_flag("Slip odds as shown", doubts, "odds"), key="slip_odds",
+                            value=ss.get("slip_odds_default"), step=1,
                             format="%d", placeholder="Same-game parlay odds, e.g. 450")
     book_ids = list(books)
-    last_book = ss.get("last_book")
-    st.selectbox("Sportsbook", book_ids, key="slip_book", format_func=books.get,
-                 index=book_ids.index(last_book) if last_book in books else 0)
-    placed = st.toggle("I placed this bet", key="slip_placed")
+    book_default = ss.get("slip_book_default", ss.get("last_book"))
+    st.selectbox(_flag("Sportsbook", doubts, "book"), book_ids, key="slip_book",
+                 format_func=books.get,
+                 index=book_ids.index(book_default) if book_default in books else 0)
+    placed = st.toggle("I placed this bet", key="slip_placed",
+                       value=bool(ss.get("slip_placed_default", False)))
     if placed:
         c1, c2 = st.columns(2)
-        c1.number_input("Stake ($)", key="slip_stake", value=None, min_value=0.01, step=5.0,
-                        format="%.2f")
-        c2.number_input("Potential payout ($, optional)", key="slip_payout", value=None,
+        c1.number_input("Stake ($)", key="slip_stake", value=ss.get("slip_stake_default"),
                         min_value=0.01, step=5.0, format="%.2f")
+        c2.number_input("Potential payout ($, optional)", key="slip_payout",
+                        value=ss.get("slip_payout_default"), min_value=0.01, step=5.0,
+                        format="%.2f")
     if slip_type is not SlipType.SINGLE:
         st.checkbox("Odds boost applied", key="slip_boosted")
     st.text_input("Notes (optional)", key="slip_notes")
