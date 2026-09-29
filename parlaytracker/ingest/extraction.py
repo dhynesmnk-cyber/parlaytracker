@@ -204,6 +204,9 @@ class Extractor:
     def __init__(self, client: ChatClient, model: str):
         self._client = client
         self._model = model
+        # The last raw reply, in memory only: never logged. `cli read-slip --save` writes it
+        # out so real replies can become test fixtures (Phase 6 exit).
+        self.last_reply: str | None = None
 
     @classmethod
     def from_settings(cls, api_key: SecretStr | None, base_url: str, model: str
@@ -220,6 +223,7 @@ class Extractor:
         try:
             response = self._client.chat.completions.create(**build_request(image, self._model))
             reply = response.choices[0].message.content or ""
+            self.last_reply = reply
         except ExtractionError:
             raise
         except Exception as e:  # the SDK's errors, timeouts, an unexpected response shape

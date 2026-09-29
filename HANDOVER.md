@@ -7,15 +7,16 @@ For the next agent picking up ParlayTracker. Read [SPEC.md](SPEC.md) first: it i
 | | |
 |---|---|
 | Code | All on `main`. Phases 0–2 were merged in [dhynesmnk-cyber/parlaytracker#4](https://github.com/dhynesmnk-cyber/parlaytracker/pull/4), Phases 3–5 in [dhynesmnk-cyber/parlaytracker#6](https://github.com/dhynesmnk-cyber/parlaytracker/pull/6). Work on a branch, and open a PR into `main`: the laptop deploys whatever is merged there |
-| Done | Phases 0, 1 and 5 (SPEC.md section 13), and the **code** for Phases 2, 3 and 4 |
+| Done | Phases 0, 1 and 5 (SPEC.md section 13), and the **code** for Phases 2, 3, 4 and 6 |
 | Phase 2 still open | Its exit criteria need the real laptop: install it, log real slips from both phones over Tailscale, reboot, update, and restore a backup once (below) |
 | Phase 3 still open | Its exit criteria need a real game day with logged slips (below) |
 | Phase 4 still open | Its exit criteria need a real weekend of games (below) |
-| Next after that | Phase 6: screenshot extraction (then 7: live tracking) |
-| Tests | 1,374 passing locally on Python 3.12 + PostgreSQL 16 (unit, database and Streamlit app tests), plus 2 `live` tests (`-m live`, 0 credits) |
+| Phase 6 still open | The code is done and tested against synthetic replies. The exit needs a `QWEN_API_KEY` and 10 real slips (below) |
+| Next after that | Phase 7: live tracking |
+| Tests | 1,590 passing locally on Python 3.12 + PostgreSQL 16 (unit, database and Streamlit app tests), plus 2 `live` tests (`-m live`, 0 credits) |
 | CI | Two jobs on every push: `test` (ruff + pytest against Postgres 16) and `deploy` (build the image, run the Compose stack as on the laptop, check web + worker, restore a backup). See the CI section at the end |
 | Hosting | A dedicated laptop at home with Docker Compose, reachable only over Tailscale (section 12) |
-| AI | Qwen through OpenRouter (section 6.3); not needed until Phase 6 |
+| AI | Qwen through OpenRouter (section 6.3). Without `QWEN_API_KEY` the Screenshot page says so and shows the ordinary form: nothing else depends on it |
 | Network | Full access is enabled for this cloud environment, and `ODDS_API_KEY` is set as an environment variable |
 
 ## What exists
@@ -27,15 +28,16 @@ For the next agent picking up ParlayTracker. Read [SPEC.md](SPEC.md) first: it i
 | `parlaytracker/ingest/http.py` | Shared httpx client (`ParlayTracker/1.0`, no cookies), `RateLimiter`, and `FetchError` with a `FailureKind` for every failure |
 | `parlaytracker/ingest/espn.py` | Box-score parser (`parse_box_score`: summary and cdn documents, read by column key), scoreboard and roster parsers (Pydantic-validated, per-event errors), status mapping, US Eastern game days, and host failover (`site.web.api` → `site.api`). Not yet routed through the breakers in `router.py`: that is Phase 4 |
 | `parlaytracker/core/analytics.py` | Pure analytics over `LegRow` / `SlipRow` (section 10): hit rate + Wilson interval, break-even, flat ROI, price and line CLV, dedupe, every dimension and filter, slip money. `load_leg_rows` / `load_slip_rows` fill the rows from Postgres |
-| `parlaytracker/app/` | Streamlit app: `main.py` (navigation, auth, health banner), `pages/analytics.py`, `auth.py` (Tailscale guard), `common.py`, `components/slip_form.py`, `pages/log.py`, `review.py`, `settings.py` |
+| `parlaytracker/ingest/extraction.py` | Screenshot reading (section 6.3, 9.6): `prepare_image` (png/jpg/webp by magic bytes, 8 MB, longest side 2000 px, EXIF upright, pixel guard), `Extractor` (one OpenAI-SDK call to OpenRouter, `temperature=0`, 45 s, `json_schema`), and `parse_reply` (forgiving: code fences, Unicode minus, string numbers, a bad field is dropped and the rest kept). Never logs or raises the key, the image or the raw reply |
+| `parlaytracker/app/` | Streamlit app: `main.py` (navigation, auth, health banner), `pages/screenshot.py` (upload, read, then the same form pre-filled), `pages/analytics.py`, `auth.py` (Tailscale guard), `common.py`, `components/slip_form.py`, `pages/log.py`, `review.py`, `settings.py` |
 | `parlaytracker/ingest/router.py` | `EspnRouter` (first provider whose breaker isn't open, falls through in the same run, classifies every failure, keeps raw samples, records watched events; the web app uses one too, with in-memory breakers), `CircuitBreaker` (one per provider, section 8.3 rules) and `Breakers`, which writes every transition to `source_health` at once and the hourly counters at each heartbeat, and restores open breakers and the Odds API quota on restart. The ESPN failover router is Phase 4 |
 | `parlaytracker/ingest/guards.py` | Pure integrity rules: progress key, stale / correction / advance, final never goes back to play, frozen-feed and probe rules, plausibility bounds. Frozen-feed *use* (the probe) is Phase 7 |
 | `parlaytracker/ingest/nflverse.py` | `NflverseData`: schedules, players, weekly stats and snap counts through `nflreadpy`, mapped only by ID, loaded once per job run, failures through the `nflverse` breaker |
 | `parlaytracker/ingest/odds_api.py` | Odds API client (`events`, `event_odds`) and Pydantic parsers. Reads `x-requests-remaining`/`x-requests-last`; feeds the breaker |
 | `parlaytracker/ingest/closing.py` | Pure closing-line selection: exact main, exact alternate, book's main line, median main (section 8.2 step 5), on parsed odds |
-| `parlaytracker/ingest/resolve.py` | Market and sport keys, team-name matching and rapidfuzz player matching (score >= 90, suffixes like Jr./III ignored). Sportsbook and market wording arrive with Phase 6 |
+| `parlaytracker/ingest/resolve.py` | Market and sport keys, team-name matching and rapidfuzz player matching (score >= 90, suffixes like Jr./III ignored). Phase 6 adds sportsbook, market, sport, team-alias, event and roster-player resolution for screenshots (`resolve_slip`) |
 | `parlaytracker/worker/settle.py` | `CheckFinals`, `Settle`, `RecheckSettled`, `VerifyNfl`, `Canary`, `prune_samples`, `sample_sink` (section 8.1, 7.1) |
-| `parlaytracker/cli.py` | `export-sample <id> <path>` and `backfill` (below) |
+| `parlaytracker/cli.py` | `export-sample <id> <path>`, `backfill` (below) and `read-slip <image> [--save path]` (reads a screenshot as the page does; `--save` keeps the raw reply as a fixture) |
 | `parlaytracker/worker/` | `__main__.py`: advisory lock, `BlockingScheduler` (defaults `coalesce=True, max_instances=1, misfire_grace_time=30`). `jobs.py`: `heartbeat`, `guarded` (a job never raises into the scheduler) and `ClosingCapture` (the `capture_closing` job). Without `ODDS_API_KEY` only the heartbeat runs |
 | `Dockerfile`, `.dockerignore`, `.streamlit/config.toml` | One image for web, worker and migrations; the config hides Streamlit's developer menu |
 | `deploy/` | `docker-compose.yml`, `setup.sh`, `update.sh`, `backup.sh`, `restore.sh`, `status.sh`, `compose.sh`, `lib.sh`, `env.example`, systemd units, and `README.md` (the user's step-by-step guide) |
@@ -43,6 +45,7 @@ For the next agent picking up ParlayTracker. Read [SPEC.md](SPEC.md) first: it i
 | `tests/live/` | Tests that call real services, run with `-m live`, all free: the Odds API events endpoint, and the canary (every ESPN provider and nflverse) |
 | `tests/fixtures/espn/*summary*`, `nfl_cdn_game_*` | Real box scores (NFL, NFL overtime, NBA, NHL, NHL overtime, and the cdn wrapper), trimmed to the fields the parser reads |
 | `tests/fixtures/nflverse/week3_2026.json` | Slices of the four nflverse datasets for week 3 of 2026 (including a game with no scores yet) |
+| `tests/fixtures/qwen/` | **Synthetic** Qwen replies, hand-written to the schema (see its README). Replace or add real ones at the Phase 6 exit |
 | `tests/support.py` | Shared helpers for worker tests: committed data, `FakeRouter` (real parsers on fixtures), `nflverse_loader` |
 | `tests/fixtures/odds_api/` | A real NFL events list and one event's odds for all 14 NFL market keys. They cost 14 credits: reuse them, don't re-fetch |
 
@@ -82,7 +85,15 @@ For the next agent picking up ParlayTracker. Read [SPEC.md](SPEC.md) first: it i
     - Weekday, month and start window are of the **Eastern** game day. Lead time has a fifth bucket, "logged after the start", which the spec doesn't list.
     - The multiple-comparisons caution appears once more than two slices are applied; tags count as one slice.
     - The group-by selectbox uses the string `"all"`, not `None`: Streamlit reads `None` as "nothing selected".
-22. **Dependencies:** each phase adds its own. Phase 3 added `apscheduler<4` and `rapidfuzz`, Phase 4 `nflreadpy` (which brings polars, pandas and pyarrow: the image is larger); later phases need `pandas`, `plotly`, `Pillow`, `openai` and `nflreadpy`.
+23. **Screenshot reading** (SPEC.md 6.3 and 9.6, plus what the spec left open):
+    - The reader only pre-fills. `slip_form.prefill` writes `*_default` keys, never a widget's own key, so the person can change anything and Save is the only write (through `create_slip`, `source = 'screenshot'`).
+    - **Doubt is marked, never resolved silently.** A leg or slip field the resolver wasn't sure of gets a "⚠ check" label. Doubtful: sport guessed from the default; a game found from one team only or a doubleheader; a market with no wording; a player scoring 75-89 (pre-selected) or with a runner-up within 3 points; a team market with no team; a line that isn't a whole or half number; odds between -99 and +99 (dropped); a sportsbook that doesn't match.
+    - A game is looked for on the slip's day, then a day either side. A name that fits two games ("New York" on a day both New York teams play) matches neither: first words shared by many teams (`new`, `los`, `san`...) are never aliases, and an alias both teams of one game share identifies neither.
+    - An **Under**, or wording we don't support, becomes an `other` leg with the slip's own words as its description. "Over/Under" and "O/U" are game totals, not Unders.
+    - A stake on the slip pre-ticks "I placed this bet" (a screenshot of a bet with a stake is usually placed): check it.
+    - Each image is read **once** (sha256 in session state), not on every rerun; after Save the uploader and form start fresh.
+    - **The SDK ships its own HTTP library** (`httpx2`), so `respx` can't intercept it. Tests give the real client a mock transport and assert the mock was reached; `tests/unit/test_extraction.py` verifies the actual wire request (URL, bearer header, body, 45 s timeout).
+24. **Dependencies:** each phase adds its own. Phase 3 added `apscheduler<4` and `rapidfuzz`, Phase 4 `nflreadpy` (which brings polars, pandas and pyarrow: the image is larger), Phase 6 `openai` and `Pillow`; later phases need `pandas`, `plotly`, `Pillow`, `openai` and `nflreadpy`.
 
 ## Gotchas
 
@@ -141,6 +152,13 @@ export TEST_DATABASE_URL="$(.venv/bin/python scripts/dev_postgres.py)"
 - **Mutation checks:** flipping the alt-spread sign, keeping the latest duplicate instead of the earliest, and an off-by-one in the low-sample threshold each made the intended tests fail.
 - **Not looked at in a browser:** the page is exercised through `AppTest`. Greying is tested on the styled frame's CSS, not by eye. Worth a glance on a phone once there is real data.
 
+## Checked by hand in Phase 6
+
+- **The wire request**, not just a fake client: with the OpenAI SDK's own transport mocked, the request is a single POST to `openrouter.ai/api/v1/chat/completions` with the bearer key, the model, `temperature` 0, a `json_schema` response format, one message holding a base64 image and the prompt, and a 45 s timeout.
+- **Failure paths through the real SDK** (401, 403, 429, 500, 503, non-JSON 200, empty completion, timeout) are all a single "Couldn't read this slip. Enter it manually." with an empty form, and no key or response body reaches the logs.
+- **Mutation checks:** dropping the player default, reading on every rerun, dropping the doubt marks, and saving as `quick_add` each made the intended tests fail; breaking the "no key in errors" safeguard made the leak test fail.
+- **Not done, and can't be without a key:** any real model call. No real slip has been read. Every Qwen reply in the tests is synthetic.
+
 ## Next steps
 
 **Phase 2, on the laptop (needs the user):**
@@ -172,7 +190,12 @@ export TEST_DATABASE_URL="$(.venv/bin/python scripts/dev_postgres.py)"
 
 **Phase 5 is done** (its exit is test-verifiable and passes). Look at the page with real data once a few games have settled; the interesting number early on is CLV, not ROI.
 
-**Phase 6 (can start now):** screenshot extraction (section 13): `extraction.py`, `resolve.py` (sportsbook and market wording, event and team aliases) and the Screenshot page, with Qwen through OpenRouter. The exit needs 10 real slips from at least 2 sportsbooks and a `QWEN_API_KEY`, which only the user can supply.
+**Phase 6, when the OpenRouter key arrives (the code is done):**
+1. Put `QWEN_API_KEY` in the laptop's `.env` (and, to try it here, as an environment variable), turn off training-permitted providers in OpenRouter's privacy settings, and `compose.sh up -d`. The Screenshot page then shows the uploader.
+2. Collect 10 real slip screenshots from at least two sportsbooks (singles, parlays and SGPs). For each: `python -m parlaytracker.cli read-slip slip.png --save tests/fixtures/qwen/real_NN.json`, and look at what came back. **Read each saved reply before committing it** (a slip can show a stake or account details), and note in `tests/fixtures/qwen/README.md` which files are real.
+3. For each, also try it on the Screenshot page. The exit is that most fields pre-fill correctly and every failure lands on the manual form. Whatever it gets wrong is a new alias or a prompt fix: add a test with the real reply.
+4. Likeliest first corrections: sportsbook wording (`BOOK_ALIASES`), market wording (`_MARKET_PATTERNS`), and whether the model puts the team in `team_text` for team markets.
+5. Pick the model deliberately: `qwen/qwen3-vl-32b-instruct` is the default (cents per hundred slips); the free `qwen/qwen3.8-27b:free` is capped at 50 requests a day. It is only a `QWEN_VISION_MODEL` setting.
 
 ## Needs the user
 
@@ -180,7 +203,7 @@ export TEST_DATABASE_URL="$(.venv/bin/python scripts/dev_postgres.py)"
 2. **Prepare the laptop:** `deploy/README.md` steps 1–3.
 3. **Both users' Tailscale login names** for `ALLOWED_LOGINS`. They're entered during setup and don't need to go in chat.
 4. **A backup destination** for `rclone` (README step 4), then one test restore (step 5).
-5. **For Phase 6 only:** an OpenRouter key as `QWEN_API_KEY`, with training-permitted providers turned off.
+5. **An OpenRouter key** as `QWEN_API_KEY`, with training-permitted providers turned off (you're waiting on customer service for this). The Screenshot page works as a plain manual form until then, and the rest of the app doesn't use it.
 
 Never paste keys into chat.
 

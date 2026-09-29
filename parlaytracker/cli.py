@@ -2,6 +2,7 @@
 
     export-sample <id> <path>   write a saved raw response out as a test fixture
     backfill                    settle everything logged before the worker could (Phase 4)
+    read-slip <image> [--save]  read a slip screenshot with Qwen; --save keeps the raw reply
 """
 import argparse
 import logging
@@ -13,6 +14,7 @@ from sqlalchemy.orm import Session
 
 from parlaytracker.core.db import make_engine
 from parlaytracker.core.models import RawSample
+from parlaytracker.ingest.extraction import Extractor
 from parlaytracker.ingest.nflverse import NflverseData
 from parlaytracker.ingest.router import Breakers, EspnRouter
 from parlaytracker.worker.__main__ import try_lock
@@ -49,6 +51,28 @@ def backfill(engine: Engine, router: EspnRouter, nflverse) -> int:
     return 0
 
 
+def read_slip(extractor, image_path: Path, save: Path | None) -> int:
+    """Read one screenshot exactly as the Screenshot page does and show what came back.
+
+    With `save`, the model's raw reply is written there: real replies are what Phase 6's exit
+    wants as fixtures in tests/fixtures/qwen/. A slip can show a stake or account details, so
+    read the file before committing it.
+    """
+    from parlaytracker.ingest.extraction import ExtractionError, prepare_image
+
+    try:
+        image = prepare_image(image_path.read_bytes())
+        slip = extractor.extract(image)
+    except (OSError, ExtractionError) as e:
+        print(f"couldn't read {image_path}: {e}", file=sys.stderr)
+        return 1
+    print(slip.model_dump_json(indent=2))
+    if save is not None:
+        save.write_text(extractor.last_reply or "")
+        print(f"saved the raw reply to {save}: check it for anything private before committing")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="parlaytracker.cli", description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -57,9 +81,21 @@ def main(argv: list[str] | None = None) -> int:
     export.add_argument("id", type=int, help="raw_samples.id")
     export.add_argument("path", type=Path)
     commands.add_parser("backfill", help="settle everything logged since Phase 2")
+    read = commands.add_parser("read-slip", help="read a slip screenshot with Qwen")
+    read.add_argument("image", type=Path)
+    read.add_argument("--save", type=Path, help="write the raw model reply to this file")
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    if args.command == "read-slip":
+        from parlaytracker.core.config import get_settings
+        settings = get_settings()
+        extractor = Extractor.from_settings(settings.qwen_api_key, settings.qwen_base_url,
+                                            settings.qwen_vision_model)
+        if extractor is None:
+            print("QWEN_API_KEY is not set", file=sys.stderr)
+            return 1
+        return read_slip(extractor, args.image, args.save)
     engine = make_engine()
     if args.command == "export-sample":
         return export_sample(engine, args.id, args.path)

@@ -263,3 +263,108 @@ def test_with_a_key_the_openai_client_points_at_openrouter():
 def test_the_schema_in_the_request_is_valid_json():
     request = ex.build_request(IMAGE, "m")
     json.dumps(request["response_format"])  # the SDK must be able to serialise it
+
+
+# --- The real SDK, with only its transport replaced ---------------------------------------------
+# The SDK ships its own HTTP library (httpx2), so respx, which patches httpx, can't see it: the
+# mock goes in as the SDK client's transport instead. Every test asserts the mock was reached,
+# so none can pass by talking to the real service.
+
+
+class Wire:
+    """A mock transport that records requests and answers with `respond(request)`."""
+
+    def __init__(self, respond):
+        import httpx2
+        from openai import OpenAI
+
+        self.requests: list = []
+        self._respond = respond
+
+        def handler(request):
+            self.requests.append(request)
+            return self._respond(request)
+
+        client = OpenAI(api_key=KEY, base_url="https://openrouter.ai/api/v1", max_retries=0,
+                        http_client=httpx2.Client(transport=httpx2.MockTransport(handler)))
+        self.extractor = Extractor(client, "qwen/qwen3-vl-32b-instruct")
+
+
+def _completion(content: str) -> dict:
+    return {"id": "gen-1", "object": "chat.completion", "created": 1, "model": "qwen/x",
+            "choices": [{"index": 0, "finish_reason": "stop",
+                         "message": {"role": "assistant", "content": content}}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}}
+
+
+def reply_with(status: int, **kwargs):
+    import httpx2
+    return lambda request: httpx2.Response(status, **kwargs)
+
+
+def test_the_sdk_sends_the_spec_request_to_openrouter():
+    wire = Wire(reply_with(200, json=_completion(reply("single_valid.json"))))
+    slip = wire.extractor.extract(IMAGE)
+    assert slip.legs[0].player_name == "Trey McBride"
+    (request,) = wire.requests  # one call per screenshot
+    assert str(request.url) == "https://openrouter.ai/api/v1/chat/completions"
+    assert request.headers["authorization"] == f"Bearer {KEY}"
+    body = json.loads(request.content)
+    assert body["model"] == "qwen/qwen3-vl-32b-instruct" and body["temperature"] == 0
+    assert body["response_format"]["type"] == "json_schema"
+    assert body["response_format"]["json_schema"]["schema"]["title"] == "ExtractedSlip"
+    (message,) = body["messages"]
+    assert [part["type"] for part in message["content"]] == ["image_url", "text"]
+    assert message["content"][0]["image_url"]["url"].startswith("data:image/png;base64,")
+    assert "Do not guess" in message["content"][1]["text"]
+
+
+def test_the_request_timeout_reaches_the_sdk():
+    seen = {}
+
+    def respond(request):
+        import httpx2
+        seen["timeout"] = request.extensions.get("timeout")
+        return httpx2.Response(200, json=_completion(reply("single_valid.json")))
+
+    wire = Wire(respond)
+    wire.extractor.extract(IMAGE)
+    assert wire.requests and seen["timeout"]["read"] == 45
+
+
+@pytest.mark.parametrize("status", [401, 403, 429, 500, 503])
+def test_http_errors_through_the_real_sdk_are_extraction_errors_that_never_leak_the_key(
+        status, caplog):
+    wire = Wire(reply_with(status, json={"error": {"message": f"nope, key {KEY}"}}))
+    with caplog.at_level("DEBUG"), pytest.raises(ExtractionError) as info:
+        wire.extractor.extract(IMAGE)
+    assert len(wire.requests) == 1  # it really reached the (mock) service
+    assert KEY not in str(info.value) and KEY not in caplog.text
+    assert str(status) in caplog.text  # the status is logged, the body isn't
+    assert "nope" not in caplog.text
+
+
+def test_a_200_that_is_not_a_chat_completion_is_an_extraction_error():
+    wire = Wire(reply_with(200, text="<html>gateway</html>"))
+    with pytest.raises(ExtractionError):
+        wire.extractor.extract(IMAGE)
+    assert len(wire.requests) == 1
+
+
+def test_a_completion_with_no_content_is_an_extraction_error():
+    wire = Wire(reply_with(200, json=_completion("")))
+    with pytest.raises(ExtractionError):
+        wire.extractor.extract(IMAGE)
+    assert len(wire.requests) == 1
+
+
+def test_a_timeout_through_the_real_sdk_is_an_extraction_error():
+    import httpx2
+
+    def respond(request):
+        raise httpx2.ReadTimeout("slow")
+
+    wire = Wire(respond)
+    with pytest.raises(ExtractionError):
+        wire.extractor.extract(IMAGE)
+    assert len(wire.requests) == 1
